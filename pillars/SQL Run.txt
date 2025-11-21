@@ -1,0 +1,41 @@
+SQL 1
+
+
+WITH n AS (
+  SELECT
+    date_trunc('minute', now() AT TIME ZONE 'utc')
+    + ((15 - (extract(minute from now() AT TIME ZONE 'utc')::int % 15)) % 15) * interval '1 minute'
+    AS now15
+)
+UPDATE reference.symbol_universe u
+SET  spot_15m_target_until_ts = n.now15,
+     fut_15m_target_until_ts  = n.now15
+FROM n
+WHERE u.universe_name = 'largecaps_v1';
+
+SQL 2
+
+
+UPDATE reference.symbol_universe
+SET  spot_15m_next_from_ts =
+        COALESCE(GREATEST(spot_15m_next_from_ts,
+                          spot_15m_last_ingested_ts + interval '15 minutes'),
+                 spot_15m_next_from_ts),
+     fut_15m_next_from_ts  =
+        COALESCE(GREATEST(fut_15m_next_from_ts,
+                          fut_15m_last_ingested_ts + interval '15 minutes'),
+                 fut_15m_next_from_ts)
+WHERE universe_name = 'largecaps_v1';
+
+
+SQL 3
+
+
+UPDATE reference.symbol_universe
+SET  spot_15m_status = 'INTRADAY_SYNCING',
+     fut_15m_status  = 'INTRADAY_SYNCING'
+WHERE universe_name = 'largecaps_v1';
+
+
+
+python scheduler/backfill_history.py --mode sync --kinds both --universe largecaps_v1
