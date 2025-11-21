@@ -1,0 +1,151 @@
+[quality]
+atr_win=14
+gap_sigma=3.0
+vahval_break_vol_mult=2.0
+atr_veto_pctile=0.90
+vol_cv_good=0.50
+vol_cv_bad=1.50
+near_vahval_atr=0.25
+
+rules_mode=additive         ; additive | override
+clamp_low=0
+clamp_high=100
+write_scenarios_debug=false
+min_bars=120
+
+[thresholds]
+bb_strong=6.5
+
+[quality_scenarios]
+list = adx_ok, adx_strong_rising, atr_dead, atr_chaos,
+       near_poc_bonus, vahval_break_with_vol, vahval_near_no_vol_fake,
+       bb_inside_va, bb_break_align, wick_clean, wick_ugly,
+       volume_stable, volume_noisy, gap_big_no_spike_veto
+       engulfing_clean, doji_at_level, hammer_at_poc,
+       bb_squeeze_filter, bb_overbought_warning, rsi_bull_div_at_val,
+       bb_strong_outside_va, bb_rejection
+       poc_anchor, poc_break_fail, vahval_vol_surge,
+       squeeze_reversal, atr_expansion_chop,
+       htf_vah_align, htf_vah_rejection
+
+[quality_scenario.adx_ok]
+when  = (adx14 >= 20) and (adx14 < 25)
+score = +5
+
+[quality_scenario.adx_strong_rising]
+when  = (adx14 >= 25) and (adx14 > adx14_prev)
+score = +15
+
+[quality_scenario.atr_dead]
+when  = (atr_pct < 2.0)
+score = -5
+
+[quality_scenario.atr_chaos]
+when  = (atr_pct >= 10.0)
+score = -20
+
+[quality_scenario.near_poc_bonus]
+when  = (near_poc == True)
+score = +10
+
+[quality_scenario.vahval_break_with_vol]
+when  = ((near_vah == True) or (near_val == True)) and (vol_ok_vahval == True)
+score = +15
+
+[quality_scenario.vahval_near_no_vol_fake]
+when  = ((near_vah == True) or (near_val == True)) and (vol_ok_vahval == False)
+score = -15
+set_reversal = true
+
+[quality_scenario.bb_inside_va]
+when  = (bb_score >= bb_strong) and (inside_va == True)
+score = +15
+
+[quality_scenario.bb_break_align]
+when  = (bb_score >= bb_strong) and (inside_va == False)
+score = +10
+
+[quality_scenario.wick_clean]
+when  = (wick_ratio < 1.0)
+score = +5
+
+[quality_scenario.wick_ugly]
+when  = (wick_ratio > 2.0)
+score = -10
+set_reversal = true
+
+[quality_scenario.volume_stable]
+when  = (vol_cv20 < vol_cv_good)
+score = +5
+
+[quality_scenario.volume_noisy]
+when  = (vol_cv20 > vol_cv_bad)
+score = -10
+
+[quality_scenario.gap_big_no_spike_veto]
+when  = (sigma60 > 0) and (gap_ratio > (gap_sigma * sigma60)) and (vol_spike_2sd == False)
+score = -15
+
+
+[quality_scenario.engulfing_clean]
+when = (engulfing_bull == True) and (wick_ratio < 1.0)
+score = +10
+
+[quality_scenario.doji_at_level]
+when = (doji_candle == True) and ((near_vah == True) or (near_val == True))
+score = -5
+
+[quality_scenario.hammer_at_poc]
+when = (hammer_bullish == True) and (near_poc == True)
+score = +15
+
+[quality_scenario.bb_squeeze_filter]
+when = (bb_width_pct < 8.0)
+score = -10
+
+[quality_scenario.bb_overbought_warning]
+when = (close > bb_upper_band)
+score = -10
+
+[quality_scenario.rsi_bull_div_at_val]
+when = (rsi_bull_div == True) and (near_val == True)
+score = +10
+
+[quality_scenario.bb_strong_outside_va]
+when = (bb_score >= bb_strong) and (inside_va == False) and (close_dist_bb > 1.0)
+score = +15
+
+[quality_scenario.bb_rejection]
+when = (bb_score < bb_strong) and ((near_vah == True) or (near_val == True))
+score = -10
+
+[quality_scenario.poc_anchor]
+when = (close > poc) and (close > open)
+score = +10
+
+[quality_scenario.poc_break_fail]
+when = (close < poc) and (open > poc) and (volume < (1.5 * volume_avg_20))
+score = -15
+set_reversal = true
+
+[quality_scenario.vahval_vol_surge]
+when = ((close > vah) or (close < val)) and (volume > (2 * volume_avg_20))
+score = +15
+
+[quality_scenario.squeeze_reversal]
+when = (bb_width_pct < 8.0) and (doji_candle == True)
+score = +10
+
+[quality_scenario.atr_expansion_chop]
+when = (adx14 < 20) and (atr_pct > (1.5 * atr_pct_avg_20))
+score = -10
+
+[quality_scenario.htf_vah_align]
+when = (close > vah) and (close > vah_htf)
+score = +10
+
+[quality_scenario.htf_vah_rejection]
+when = (high > vah_htf) and (close < vah_htf)
+score = -15
+set_reversal = true
+

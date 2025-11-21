@@ -1,0 +1,161 @@
+[flow]
+mfi_len=14
+rvol_strong=1.5
+rvol_extreme=2.0
+vol_cv_good=0.50
+vol_cv_bad=1.50
+voi_scale=10.0
+roll_look=5
+roll_drop_pct=0.35
+spread_bps_veto=40.0
+min_rvol_veto=0.50
+vol_rank_floor=0.20
+min_turnover=0.0
+
+rules_mode=additive          ; additive | override
+clamp_low=0
+clamp_high=100
+write_scenarios_debug=false
+min_bars=120
+
+[flow_scenarios]
+list = mfi_rising, mfi_hot_cap,
+       obv_confirmed, obv_divergence_pen,
+       rvol_strong_ok, rvol_extreme_bonus, rvol_noisy_pen,
+       voi_long_build, voi_short_cover, voi_short_build_pen, voi_long_unwind_pen, roll_trap_veto,
+       liquidity_veto, liquidity_ok_bonus,
+       session_open_close_boost, session_midday_drag,
+       rvol_breakout_bonus, failed_breakout_vol, strong_close_vol,
+       oi_long_unwind_reversal, oi_short_build_confirm,
+       bull_div_obv, bear_div_mfi
+
+
+
+[flow_scenario.mfi_rising]
+when  = (mfi_up == True) and (mfi_val < 80)
+score = +15
+
+[flow_scenario.mfi_hot_cap]
+when  = (mfi_up == True) and (mfi_val >= 80)
+score = +10
+
+[flow_scenario.obv_confirmed]
+when  = (obv_above_ema == True) and (obv_hh == True)
+score = +20
+bonus_when = (price_hh == True)
+bonus = +5
+
+[flow_scenario.obv_divergence_pen]
+when  = (price_hh == True) and (obv_hh == False)
+score = -10
+
+[flow_scenario.rvol_strong_ok]
+when  = (rvol_strong == True) and (vol_cv20 <= 1.0)
+score = +15
+
+[flow_scenario.rvol_extreme_bonus]
+when  = (rvol_extreme == True) and (vol_cv20 <= 1.0)
+score = +10
+
+[flow_scenario.rvol_noisy_pen]
+when  = (vol_cv20 > 1.5)
+score = -5
+
+[flow_scenario.voi_long_build]
+when  = (voi_long_build == True)
+score = +18
+bonus_when = (voi_mag >= 0.02)
+bonus = +5
+
+[flow_scenario.voi_short_cover]
+when  = (voi_short_cover == True)
+score = +10
+
+[flow_scenario.voi_short_build_pen]
+when  = (voi_short_build == True)
+score = -18
+
+[flow_scenario.voi_long_unwind_pen]
+when  = (voi_long_unwind == True)
+score = -10
+
+[flow_scenario.roll_trap_veto]
+when  = (roll_trap == True)
+score = -8
+set_veto = true
+
+[flow_scenario.liquidity_veto]
+when  = (illiquid_flag == True)
+score = -20
+set_veto = true
+
+[flow_scenario.liquidity_ok_bonus]
+when  = (illiquid_flag == False) and (rvol_now >= 1.0)
+score = +5
+
+[flow_scenario.session_open_close_boost]
+when  = (in_session == True) and ((near_open == True) or (near_close == True))
+score = +5
+
+[flow_scenario.session_midday_drag]
+when  = (mid_lunch == True)
+score = -3
+
+[flow_scenario.rvol_breakout_bonus]
+when = (rvol_now >= rvol_strong) and ((near_vah_break == True) or (near_val_break == True))
+score = +15
+
+[flow_scenario.failed_breakout_vol]
+when = ((close_val_break_fail == True) or (close_vah_break_fail == True)) and (rvol_now >= rvol_strong)
+score = -15
+
+[flow_scenario.strong_close_vol]
+when = (wick_ratio < 1.0) and (rvol_now >= rvol_strong)
+score = +10
+
+[flow_scenario.oi_long_unwind_reversal]
+when = (voi_long_unwind == True) and (price_reversal_candle == True)
+score = +15
+
+[flow_scenario.oi_short_build_confirm]
+when = (voi_short_build == True) and (mfi_val < 40)
+score = +15
+
+[flow_scenario.bull_div_obv]
+when = (price_lower_low == True) and (obv_higher_low == True)
+score = +10
+
+[flow_scenario.bear_div_mfi]
+when = (price_higher_high == True) and (mfi_val < mfi_prev_high)
+score = -10
+
+[flow_scenario.rvol_breakout_bonus]
+when = (rvol_strong == True) and ((near_vah_break == True) or (near_val_break == True))
+score = +15
+
+[flow_scenario.failed_breakout_vol]
+when = ((close_val_break_fail == True) or (close_vah_break_fail == True)) and (rvol_strong == True)
+score = -15
+
+[flow_scenario.strong_close_vol]
+when = (wick_ratio < 1.0) and (rvol_strong == True)
+score = +10
+
+[flow_scenario.oi_long_unwind_reversal]
+when = (voi_long_unwind == True) and (price_reversal_candle == True)
+score = +15
+
+
+[flow_scenario.oi_short_build_confirm]
+when = (voi_short_build == True) and (mfi_val < 40)
+score = +15
+
+[flow_scenario.bull_div_obv]
+when = (price_lower_low == True) and (obv_higher_low == True)
+score = +10
+
+
+[flow_scenario.bear_div_mfi]
+when = (price_higher_high == True) and (mfi_val < mfi_prev_high)
+score = -10
+
