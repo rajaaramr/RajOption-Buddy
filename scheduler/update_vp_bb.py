@@ -913,12 +913,13 @@ def _write_vp_bb(
 # ---------------------------------------------------------------------
 # Driver (per symbol) — writes TAIL of bars per TF with reasons
 # ---------------------------------------------------------------------
-def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optional[pd.DataFrame] = None) -> int:
+def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optional[pd.DataFrame] = None, start_dt: Optional[datetime] = None) -> int:
     """
     HYBRID VERSION:
     - Keeps original VP/BB math, gating, diagnostics and reasons.
     - Changes ONLY the I/O pattern: per-TF per-symbol bulk upserts instead of per-row.
     - If 'df' is provided (15m OHLCV), it uses that instead of reloading from DB.
+    - If 'start_dt' is provided, processes data from that point (incremental).
     """
     cfg = cfg or load_vpbb_cfg()
 
@@ -953,16 +954,19 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
             }
 
             # --- Incremental / Tail Logic ---
-            # 1. Get last run TS for this TF
-            last_ts = _get_last_vpbb_ts(symbol, kind, tf)
+            # 1. Get last run TS for this TF (prefer start_dt if passed)
+            if start_dt:
+                last_ts = start_dt
+            else:
+                last_ts = _get_last_vpbb_ts(symbol, kind, tf)
 
             # 2. Determine start TS (overlap by 1-2 bars to catch updates)
             start_ts = None
             if last_ts:
-                # Go back 2 intervals to be safe (re-eval open/closing bars)
-                # We can rough estimate or just use index
-                start_ts = last_ts - timedelta(minutes=15 * 30) # Rough safe margin or use index lookup
-                # Better: Filter dftf index
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=TZ)
+                # Go back ~4 hours to be safe (re-eval open/closing bars)
+                start_ts = last_ts - timedelta(hours=4)
 
             # 3. Select indices to process
             tail_n = max(1, int(cfg.backfill_bars))
@@ -1109,11 +1113,12 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
 # Batch entry
 # ---------------------------------------------------------------------
 def run(symbols: Optional[List[str]] = None, *, kind: Optional[str] = None,
-        uid: Optional[str] = None, status_cb=None, df: Optional[pd.DataFrame] = None) -> Dict[str, object]:
+        uid: Optional[str] = None, status_cb=None, df: Optional[pd.DataFrame] = None, start_dt: Optional[datetime] = None) -> Dict[str, object]:
     """
     Batch VP+BB. Caller (indicators_worker) provides the symbol list.
     - kind: override market_kind from cfg ('spot' or 'futures')
     - df: Optional pre-loaded 15m dataframe. ONLY valid if len(symbols)==1.
+    - start_dt: Optional timestamp to start incremental processing from.
     Returns {"rows": <int>, "last_ts": <datetime|None>}
     """
     cfg = load_vpbb_cfg()
@@ -1136,7 +1141,7 @@ def run(symbols: Optional[List[str]] = None, *, kind: Optional[str] = None,
             if status_cb: status_cb("ZON_COMPUTING_PROFILE")
             if status_cb: status_cb("ZON_COMPUTING_BB")
             # Pass df only if it's the correct context (though we already checked len=1)
-            n = process_symbol(s, cfg=cfg, df=df)
+            n = process_symbol(s, cfg=cfg, df=df, start_dt=start_dt)
             total += n
             if status_cb: status_cb("ZON_WRITING")
             last_ts = last_ts or datetime.now(TZ)

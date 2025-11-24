@@ -404,6 +404,12 @@ def _exec(sql: str, params: Iterable[Any] | None = None) -> None:
 # =========================
 # Batch pickers
 # =========================
+class WorkItem(TypedDict):
+    unique_id: Optional[str]
+    symbol: str
+    last_spot: Optional[datetime]
+    last_fut: Optional[datetime]
+
 def fetch_batch_universe(limit: int = 200) -> List[WorkItem]:
     """
     Drive from reference.symbol_universe for BASE_INTERVAL (15m by default).
@@ -417,7 +423,7 @@ def fetch_batch_universe(limit: int = 200) -> List[WorkItem]:
              COALESCE((SELECT max(ts) FROM market.futures_candles fc WHERE fc.symbol=u.symbol AND fc.interval IN ('15m',%s)), 'epoch'::timestamptz) AS newest_fut_ts
         FROM reference.symbol_universe u
     )
-    SELECT NULL::text AS unique_id, s.symbol
+    SELECT NULL::text AS unique_id, s.symbol, u.ind_last_spot_run_at, u.ind_last_fut_run_at
       FROM s
       JOIN reference.symbol_universe u USING(symbol)
         WHERE (u.ind_last_spot_run_at IS NULL OR u.ind_last_spot_run_at < s.newest_spot_ts)
@@ -428,7 +434,16 @@ def fetch_batch_universe(limit: int = 200) -> List[WorkItem]:
     with get_db_connection() as conn, conn.cursor() as cur:
         # note: only 3 params now
         cur.execute(sql, (BASE_INTERVAL, BASE_INTERVAL, limit))
-        return [{"unique_id": None, "symbol": r[1]} for r in cur.fetchall()]
+        rows = cur.fetchall()
+        return [
+            {
+                "unique_id": None,
+                "symbol": r[1],
+                "last_spot": r[2] if r[2] else None,
+                "last_fut": r[3] if r[3] else None
+            }
+            for r in rows
+        ]
 
 def _resample_from_15m(df15: pd.DataFrame, tf: str) -> pd.DataFrame:
     """
@@ -582,10 +597,11 @@ def _get_latest_metric_ts(symbol: str, kind: str) -> Optional[datetime]:
         else None
     )
 
+# Note: we now prefer passing last_run_at from the universe table if available
 def _get_last_vwap_ts(symbol: str, kind: str) -> Optional[datetime]:
+    # Fallback if universe table didn't provide it
     tbl = _frames_table(kind)
     with get_db_connection() as conn, conn.cursor() as cur:
-        # We look for where vwap_session is NOT NULL
         cur.execute(f"SELECT max(ts) FROM {tbl} WHERE symbol=%s AND vwap_session IS NOT NULL", (symbol,))
         row = cur.fetchone()
     if row and row[0]:
@@ -867,6 +883,7 @@ def write_futures_vwap_session(
     run_id: Optional[str] = None,
     source: str = "session_vwap",
     df15: Optional[pd.DataFrame] = None,
+    start_dt: Optional[datetime] = None,
 ) -> int:
     """
     Compute Session VWAP (IST day) from futures candles and upsert into
@@ -895,9 +912,16 @@ def write_futures_vwap_session(
 
     # Optimization: Calculate on full history for correctness, but only write recent data
     # to avoid massive DB I/O on every run.
-    last_ts = _get_last_vwap_ts(symbol, "futures")
+    if start_dt:
+        last_ts = start_dt
+    else:
+        last_ts = _get_last_vwap_ts(symbol, "futures")
+
     if last_ts:
         # Overlap by ~4 hours to ensure continuity and catch late updates/re-calcs
+        # Ensure last_ts is offset-aware (it should be from universe fetch)
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
     else:
         # No history? Write last 2 days as a safe default for "live" backfill
@@ -950,6 +974,7 @@ def write_spot_vwap_session(
     run_id: Optional[str] = None,
     source: str = "session_vwap",
     df15: Optional[pd.DataFrame] = None,
+    start_dt: Optional[datetime] = None,
 ) -> int:
     if df15 is not None and not df15.empty:
         vwap_series = _compute_session_vwap_series(df15)
@@ -971,8 +996,14 @@ def write_spot_vwap_session(
     table = "indicators.spot_frames"
 
     # Optimization: Calculate on full history for correctness, but only write recent data
-    last_ts = _get_last_vwap_ts(symbol, "spot")
+    if start_dt:
+        last_ts = start_dt
+    else:
+        last_ts = _get_last_vwap_ts(symbol, "spot")
+
     if last_ts:
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
     else:
         write_cutoff = datetime.now(TZ) - timedelta(days=2)
@@ -1635,6 +1666,13 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
         print(f"\n🧮 Indicators: {sym}")
 
         for kind in kinds:
+            # Extract last run timestamp from fetched row
+            # Note: fetch_batch_universe returns lowercase keys in WorkItem dict
+            last_run_at = r.get("last_spot" if kind == "spot" else "last_fut")
+            # Ensure timezone awareness if present
+            if isinstance(last_run_at, datetime) and last_run_at.tzinfo is None:
+                last_run_at = last_run_at.replace(tzinfo=TZ)
+
             try:
                 with get_db_connection() as _conn:
                     start, target, should_run = _plan_indicator_window(
@@ -1672,12 +1710,12 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
 
                 # Session VWAP → frames for BOTH kinds (unchanged behavior)
                 if kind == "futures":
-                    wrote_vwap_sess = write_futures_vwap_session(sym, df15=df15)
+                    wrote_vwap_sess = write_futures_vwap_session(sym, df15=df15, start_dt=last_run_at)
                     print(
                         f"[WRITE] futures:{sym} → vwap_session rows={wrote_vwap_sess}"
                     )
                 else:
-                    wrote_vwap_sess = write_spot_vwap_session(sym, df15=df15)
+                    wrote_vwap_sess = write_spot_vwap_session(sym, df15=df15, start_dt=last_run_at)
                     print(
                         f"[WRITE] spot:{sym} → vwap_session rows={wrote_vwap_sess}"
                     )
@@ -1736,11 +1774,11 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
             try:
                 if hasattr(vpbb, "run"):
                     # correct entrypoint: handles kind='spot' | 'futures' | None (ini) safely
-                    # Pass df15 to avoid re-fetching data
+                    # Pass df15 to avoid re-fetching data, and start_dt for incremental
                     try:
-                        vpbb.run(symbols=[sym], kind=kind, df=df15)
+                        vpbb.run(symbols=[sym], kind=kind, df=df15, start_dt=last_run_at)
                     except TypeError:
-                         # Fallback if vpbb.run doesn't support df yet
+                         # Fallback if vpbb.run doesn't support args yet
                         vpbb.run(symbols=[sym], kind=kind)
                 else:
                     # fallback: call process_symbol with an explicit cfg.market_kind
@@ -1749,9 +1787,8 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
                     ):
                         _cfg = vpbb.load_vpbb_cfg()
                         _cfg.market_kind = kind  # force the side we're looping
-                        # Try passing df if supported (we will update vpbb next)
                         try:
-                            vpbb.process_symbol(sym, cfg=_cfg, df=df15)
+                            vpbb.process_symbol(sym, cfg=_cfg, df=df15, start_dt=last_run_at)
                         except TypeError:
                             vpbb.process_symbol(sym, cfg=_cfg)
                     else:
