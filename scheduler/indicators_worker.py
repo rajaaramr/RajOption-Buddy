@@ -923,10 +923,17 @@ def write_futures_vwap_session(
         # Ensure last_ts is offset-aware (it should be from universe fetch)
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
+
+        # Safety: if last_ts is unreasonably close to now (less than 15m),
+        # assume we might need a bit more overlap or just rely on start_dt if it was explicit.
+        # If last_ts is very recent, going back 4 hours is safe.
         write_cutoff = last_ts - timedelta(hours=4)
     else:
         # No history? Write last 2 days as a safe default for "live" backfill
         write_cutoff = datetime.now(TZ) - timedelta(days=2)
+
+    # Ensure we don't filter out everything if write_cutoff > last available data
+    # But if vwap_series is empty, we return 0 anyway.
 
     vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
 

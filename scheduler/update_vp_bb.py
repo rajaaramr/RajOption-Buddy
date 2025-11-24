@@ -984,6 +984,14 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
             if start_ts:
                 # Process from start_ts onwards
                 idxs = dftf.index[dftf.index >= start_ts]
+                # FALLBACK: If index selection returns empty (e.g. data is slightly behind start_ts),
+                # force at least the last few bars to ensure continuity if dftf is not empty.
+                if len(idxs) == 0 and not dftf.empty:
+                    # e.g. check if start_ts is ahead of last data point
+                    if start_ts > dftf.index[-1]:
+                        # This can happen if 'last_run_at' was updated by another process
+                        # or simply clock skew. We'll process the very last bar just in case.
+                        idxs = dftf.index[-1:]
             else:
                 # Fallback to tail backfill if no history
                 idxs = dftf.index[-tail_n:]
