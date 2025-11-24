@@ -582,6 +582,16 @@ def _get_latest_metric_ts(symbol: str, kind: str) -> Optional[datetime]:
         else None
     )
 
+def _get_last_vwap_ts(symbol: str, kind: str) -> Optional[datetime]:
+    tbl = _frames_table(kind)
+    with get_db_connection() as conn, conn.cursor() as cur:
+        # We look for where vwap_session is NOT NULL
+        cur.execute(f"SELECT max(ts) FROM {tbl} WHERE symbol=%s AND vwap_session IS NOT NULL", (symbol,))
+        row = cur.fetchone()
+    if row and row[0]:
+        return pd.to_datetime(row[0], utc=True).to_pydatetime()
+    return None
+
 
 # =========================
 # Session VWAP for futures → write to futures snapshot
@@ -884,8 +894,15 @@ def write_futures_vwap_session(
     table = _frames_table("futures")  # indicators.futures_frames
 
     # Optimization: Calculate on full history for correctness, but only write recent data
-    # to avoid massive DB I/O on every run. Writing last 2 days covers "today" + margin.
-    write_cutoff = datetime.now(TZ) - timedelta(days=2)
+    # to avoid massive DB I/O on every run.
+    last_ts = _get_last_vwap_ts(symbol, "futures")
+    if last_ts:
+        # Overlap by ~4 hours to ensure continuity and catch late updates/re-calcs
+        write_cutoff = last_ts - timedelta(hours=4)
+    else:
+        # No history? Write last 2 days as a safe default for "live" backfill
+        write_cutoff = datetime.now(TZ) - timedelta(days=2)
+
     vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
 
     # Build bulk rows for UPSERT
@@ -954,7 +971,12 @@ def write_spot_vwap_session(
     table = "indicators.spot_frames"
 
     # Optimization: Calculate on full history for correctness, but only write recent data
-    write_cutoff = datetime.now(TZ) - timedelta(days=2)
+    last_ts = _get_last_vwap_ts(symbol, "spot")
+    if last_ts:
+        write_cutoff = last_ts - timedelta(hours=4)
+    else:
+        write_cutoff = datetime.now(TZ) - timedelta(days=2)
+
     vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
 
     payload = []

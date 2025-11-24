@@ -215,6 +215,19 @@ def _table_name(kind: str) -> str:
 def _frames_table(kind: str) -> str:
     return "indicators.futures_frames" if kind == "futures" else "indicators.spot_frames"
 
+def _get_last_vpbb_ts(symbol: str, kind: str, tf: str) -> Optional[datetime]:
+    """Fetch the latest timestamp that has valid VP/BB data."""
+    tbl = _frames_table(kind)
+    # check bb_score to see if we ran there
+    sql = f"SELECT max(ts) FROM {tbl} WHERE symbol=%s AND interval=%s AND bb_score IS NOT NULL"
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (symbol, tf))
+        row = cur.fetchone()
+    if row and row[0]:
+        # return as UTC datetime
+        return pd.to_datetime(row[0], utc=True).to_pydatetime()
+    return None
+
 def _now_utc() -> datetime: return datetime.now(TZ)
 def _cutoff_days(n: int) -> datetime: return _now_utc() - timedelta(days=n)
 
@@ -939,9 +952,30 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                 "min_blocks": cfg.min_blocks
             }
 
-            # --- Backfill tail N bars per TF ---
-            tail_n = max(1, int(cfg.backfill_bars))
-            idxs = dftf.index[-tail_n:]
+            # --- Incremental / Tail Logic ---
+            # 1. Get last run TS for this TF
+            last_ts = _get_last_vpbb_ts(symbol, kind, tf)
+
+            # 2. Determine start TS (overlap by 1-2 bars to catch updates)
+            start_ts = None
+            if last_ts:
+                # Go back 2 intervals to be safe (re-eval open/closing bars)
+                # We can rough estimate or just use index
+                start_ts = last_ts - timedelta(minutes=15 * 30) # Rough safe margin or use index lookup
+                # Better: Filter dftf index
+
+            # 3. Select indices to process
+            if start_ts:
+                # Process from start_ts onwards
+                idxs = dftf.index[dftf.index >= start_ts]
+            else:
+                # Fallback to tail backfill if no history
+                tail_n = max(1, int(cfg.backfill_bars))
+                idxs = dftf.index[-tail_n:]
+
+            if len(idxs) == 0:
+                continue
+
             wrote_tf = 0
 
             # NEW: buffers for bulk upsert

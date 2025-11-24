@@ -47,12 +47,12 @@ def _load_ini(path: str = DEFAULT_INI) -> NLConfig:
     cfg.read(path)
 
     tfs = [x.strip() for x in cfg.get("nonlinear", "tfs", fallback="15m,30m,60m").split(",") if x.strip()]
-    
+
     interactions = {}
     if cfg.has_section("interactions"):
         for k, v in cfg.items("interactions"):
             interactions[k.upper()] = v.strip() # Normalize keys
-            
+
     return NLConfig(
         tfs=tfs,
         lookback_n=cfg.getint("nonlinear", "lookback_n", fallback=200),
@@ -142,7 +142,7 @@ def _get_existing_columns(kind: str) -> set[str]:
     schema, table = tbl.split(".")
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT column_name FROM information_schema.columns 
+            SELECT column_name FROM information_schema.columns
             WHERE table_schema=%s AND table_name=%s
         """, (schema, table))
         return {r[0] for r in cur.fetchall()}
@@ -150,7 +150,7 @@ def _get_existing_columns(kind: str) -> set[str]:
 def _fetch_data_vectorized(symbol: str, kind: str, tf: str, lookback: int, required_metrics: List[str]) -> pd.DataFrame:
     """Fetch all required columns in ONE query."""
     existing_cols = _get_existing_columns(kind)
-    
+
     # Map requested metrics to actual DB columns
     db_cols = {"ts"}
     for m in required_metrics:
@@ -158,22 +158,22 @@ def _fetch_data_vectorized(symbol: str, kind: str, tf: str, lookback: int, requi
         col = _COL_MAP.get(m.upper()) or m.lower()
         if col in existing_cols:
             db_cols.add(col)
-            
+
     if len(db_cols) < 2: return pd.DataFrame() # Only TS found
 
     query_cols = ", ".join(sorted(list(db_cols)))
     tbl = _frames_table(kind)
-    
+
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(f"""
-            SELECT {query_cols} FROM {tbl} 
-            WHERE symbol=%s AND interval=%s 
+            SELECT {query_cols} FROM {tbl}
+            WHERE symbol=%s AND interval=%s
             ORDER BY ts DESC LIMIT %s
         """, (symbol, tf, lookback))
         rows = cur.fetchall()
-        
+
     if not rows: return pd.DataFrame()
-    
+
     df = pd.DataFrame(rows, columns=sorted(list(db_cols)))
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     return df.set_index("ts").sort_index()
@@ -181,9 +181,9 @@ def _fetch_data_vectorized(symbol: str, kind: str, tf: str, lookback: int, requi
 def _bulk_upsert(kind: str, df: pd.DataFrame, symbol: str, tf: str, run_id: str):
     """Bulk write results."""
     if df.empty: return 0
-    
+
     tbl = _frames_table(kind)
-    
+
     # Prepare data for execute_values
     # We write: nli_*, nl_prob, nl_score, nl_prob_final, nl_score_final
     cols_to_write = [c for c in df.columns if c.startswith("nli_") or c.startswith("nl_")]
@@ -191,7 +191,7 @@ def _bulk_upsert(kind: str, df: pd.DataFrame, symbol: str, tf: str, run_id: str)
 
     # Build column list for INSERT
     db_cols = ["symbol", "interval", "ts", "run_id", "source"] + cols_to_write
-    
+
     # Prepare values
     values = []
     for ts, row in df.iterrows():
@@ -202,18 +202,18 @@ def _bulk_upsert(kind: str, df: pd.DataFrame, symbol: str, tf: str, run_id: str)
     # Construct ON CONFLICT update
     updates = [f"{c}=EXCLUDED.{c}" for c in cols_to_write]
     updates.append("updated_at=NOW()")
-    
+
     sql = f"""
         INSERT INTO {tbl} ({', '.join(db_cols)})
         VALUES %s
-        ON CONFLICT (symbol, interval, ts) 
+        ON CONFLICT (symbol, interval, ts)
         DO UPDATE SET {', '.join(updates)}
     """
-    
+
     with get_db_connection() as conn, conn.cursor() as cur:
         pgx.execute_values(cur, sql, values, page_size=2000)
         conn.commit()
-    
+
     return len(values)
 
 # ====================== Vectorized Calculation ======================
@@ -222,11 +222,11 @@ def _calculate_zscores(df: pd.DataFrame, window: int) -> pd.DataFrame:
     """Vectorized Rolling Z-Score."""
     # Only calculate for numeric feature columns (exclude ts, metadata)
     numeric_cols = df.select_dtypes(include=[np.number]).columns
-    
+
     roll = df[numeric_cols].rolling(window=window, min_periods=max(1, window//4))
     mean = roll.mean()
     std = roll.std(ddof=1).replace(0, np.nan)
-    
+
     return (df[numeric_cols] - mean) / std
 
 def _evaluate_interactions_vectorized(df_z: pd.DataFrame, interactions: Dict[str, str]) -> pd.DataFrame:
@@ -234,7 +234,7 @@ def _evaluate_interactions_vectorized(df_z: pd.DataFrame, interactions: Dict[str
     Evaluates expressions like "RSI * ADX" on the entire dataframe at once.
     """
     results = pd.DataFrame(index=df_z.index)
-    
+
     # Create a namespace mapping keys to Series
     # If expression uses "MACD.hist", we need to map it to column "macd_hist"
     # We create a local dictionary where keys are the config names
@@ -244,24 +244,33 @@ def _evaluate_interactions_vectorized(df_z: pd.DataFrame, interactions: Dict[str
         if col in df_z.columns:
             local_dict[key] = df_z[col] # Direct Series reference
             local_dict[key.replace(".", "_")] = df_z[col] # Safe alias
-            
+
     for name, expr in interactions.items():
         try:
             # Sanitize expr for pd.eval (simple math only)
-            # If safe, use pd.eval or numexpr. 
+            # If safe, use pd.eval or numexpr.
             # For now, python eval with pandas Series overrides operators efficiently.
             # We replace known metrics with 'local_dict["METRIC"]'
-            
+
             # Simple parsing: Replace keywords in Expr with local_dict lookups
-            # Optimization: This is risky if not careful, but standard for vectorization
-            # Better approach: Compute manually for known types
-            
-            # Let's support standard operators: * + - /
-            # We assume expr is simple like "A * B"
-            
-            # 1. Identify tokens
+            # Token-based replacement to handle case sensitivity (e.g. MACD.hist vs MACD.HIST)
+            # We iterate over the tokens we extracted earlier
+            for t in tokens:
+                # Ignore numeric literals
+                if t.isnumeric():
+                    continue
+
+                # Try to find mapping
+                col = _COL_MAP.get(t.upper()) or t.lower()
+
+                # If we have this column in our dataframe, replace the token in the expression
+                if col in df_z.columns:
+                    # Simple replace might be risky if tokens are substrings of each other (e.g. A and AA)
+                    # But tokens come from split(), so likely distinct.
+                    # Ideally use regex or strict replacement, but .replace() is decent for these simple math expressions.
+                    mapped_expr = mapped_expr.replace(t, col)
             tokens = [t for t in expr.replace("*"," ").replace("+"," ").replace("-"," ").replace("/"," ").split() if t.strip()]
-            
+
             # 2. Check data availability
             if not all((t in local_dict or t.replace(".","_") in local_dict) for t in tokens if not t.isnumeric()):
                 results[f"nli_{name.lower()}"] = 0.0
@@ -271,16 +280,28 @@ def _evaluate_interactions_vectorized(df_z: pd.DataFrame, interactions: Dict[str
             # Map col names in expression to dataframe columns
             # e.g. "MACD.hist * ATR" -> "macd_hist * atr_14"
             mapped_expr = expr
-            for k, col in _COL_MAP.items():
-                if k in expr:
-                    # Only replace if it matches a column we actually have
-                    if col in df_z.columns:
-                        mapped_expr = mapped_expr.replace(k, col)
-            
+
+            # Token-based replacement to handle case sensitivity (e.g. MACD.hist vs MACD.HIST)
+            # We iterate over the tokens we extracted earlier
+            for t in tokens:
+                # Ignore numeric literals
+                if t.isnumeric():
+                    continue
+
+                # Try to find mapping
+                col = _COL_MAP.get(t.upper()) or t.lower()
+
+                # If we have this column in our dataframe, replace the token in the expression
+                if col in df_z.columns:
+                    # Simple replace might be risky if tokens are substrings of each other (e.g. A and AA)
+                    # But tokens come from split(), so likely distinct.
+                    # Ideally use regex or strict replacement, but .replace() is decent for these simple math expressions.
+                    mapped_expr = mapped_expr.replace(t, col)
+
             # Evaluate on the Z-Score DataFrame
             res = df_z.eval(mapped_expr)
             results[f"nli_{name.lower()}"] = res
-            
+
         except Exception as e:
             # print(f"Vector eval error {name}: {e}")
             results[f"nli_{name.lower()}"] = 0.0
@@ -300,7 +321,7 @@ _MODEL_CACHE = {}
 def _get_model(ml_cfg: MLCfg):
     if not ml_cfg.enabled: return None
     if ml_cfg.model_path in _MODEL_CACHE: return _MODEL_CACHE[ml_cfg.model_path]
-    
+
     try:
         artifact = joblib.load(ml_cfg.model_path)
         _MODEL_CACHE[ml_cfg.model_path] = artifact
@@ -313,7 +334,7 @@ def _predict_vectorized(model_artifact, df_features: pd.DataFrame) -> pd.Series:
     """Runs prediction on the whole dataframe."""
     model = model_artifact.get("model")
     features = model_artifact.get("features", [])
-    
+
     # Align columns
     X = pd.DataFrame(index=df_features.index)
     for f in features:
@@ -323,9 +344,9 @@ def _predict_vectorized(model_artifact, df_features: pd.DataFrame) -> pd.Series:
             X[f] = df_features[col]
         else:
             X[f] = 0.0 # Missing feature fill
-            
+
     X = X.fillna(0.0)
-    
+
     try:
         # Predict
         probs = model.predict(X)
@@ -343,9 +364,9 @@ def _predict_vectorized(model_artifact, df_features: pd.DataFrame) -> pd.Series:
 def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] = None, ini_path: str = DEFAULT_INI) -> int:
     if cfg is None: cfg = _load_ini(ini_path)
     ml_cfg = _load_ml_cfg(ini_path)
-    
+
     total_rows = 0
-    
+
     # 1. Identify Required Columns
     # Extract tokens from interaction expressions
     required_metrics = set()
@@ -353,7 +374,7 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
         # simplistic extraction of words
         tokens = [t.strip() for t in expr.replace("*"," ").replace("+"," ").split()]
         required_metrics.update(tokens)
-    
+
     # Add ML features if enabled
     model_artifact = _get_model(ml_cfg)
     if model_artifact:
@@ -366,21 +387,21 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
         # We need lookback_n (for z-score) + backfill_bars (for processing)
         fetch_rows = cfg.lookback_n + cfg.backfill_bars
         df = _fetch_data_vectorized(symbol, kind, tf, fetch_rows, required_metrics)
-        
+
         if len(df) < cfg.lookback_n: continue
 
         # 3. Calculate Z-Scores (Vectorized)
         df_z = _calculate_zscores(df, cfg.lookback_n)
-        
+
         # 4. Calculate Interactions (Vectorized)
         df_res = _evaluate_interactions_vectorized(df_z, cfg.interactions)
-        
+
         # 5. Calculate Baseline Score
         # Sum of interactions
         z_sum = df_res.sum(axis=1)
         df_res["nl_prob"] = _score_vectorized(z_sum, cfg.score_method, cfg.score_k)
         df_res["nl_score"] = (df_res["nl_prob"] * 100.0).round(2)
-        
+
         # 6. ML Prediction (Vectorized)
                 # 6. ML Prediction (Vectorized)
         probs_ml = None
@@ -424,7 +445,7 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
             print(f"   [NL-ML] {symbol} {kind} {tf}: wrote {n_conf} conf_ml rows")
 
         print(f"   [NL] {symbol} {kind} {tf}: Processed {n} frame rows (Vectorized)")
-      
+
         print(f"   [NL] {symbol} {tf}: Processed {n} rows (Vectorized)")
 
     return total_rows
@@ -432,7 +453,7 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
 def run(symbols: Optional[List[str]] = None, kinds: Tuple[str,...] = ("futures","spot"), ini_path: str = DEFAULT_INI) -> int:
     cfg = _load_ini(ini_path)
     if not symbols: return 0
-    
+
     count = 0
     for s in symbols:
         for k in kinds:
