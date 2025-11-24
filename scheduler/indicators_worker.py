@@ -820,20 +820,35 @@ def _load_fut_intra_today(symbol: str) -> List[Dict[str, Any]]:
     return []
 
 
-def _compute_session_vwap(
-    rows: List[Dict[str, Any]]
-) -> List[Tuple[datetime, Optional[float]]]:
-    out: List[Tuple[datetime, Optional[float]]] = []
-    cum_pv = 0.0
-    cum_v = 0.0
-    for r in rows:
-        tp = (r["high"] + r["low"] + r["close"]) / 3.0
-        v = max(0.0, float(r["volume"]))
-        cum_pv += tp * v
-        cum_v += v
-        vwap = (cum_pv / cum_v) if cum_v > 0 else None
-        out.append((r["ts"], vwap))
-    return out
+def _compute_session_vwap_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Vectorized Session VWAP computation for the whole DataFrame.
+    Resets VWAP at the start of each IST day.
+    """
+    if df.empty:
+        return pd.Series(dtype="float64")
+
+    # Localize to IST for day grouping
+    df_ist = df.copy()
+    if df_ist.index.tz is None:
+        df_ist.index = df_ist.index.tz_localize("UTC")
+    df_ist.index = df_ist.index.tz_convert("Asia/Kolkata")
+
+    grouper = df_ist.index.date
+    tp = (df_ist["high"] + df_ist["low"] + df_ist["close"]) / 3.0
+    vol = df_ist["volume"].fillna(0.0)
+    pv = tp * vol
+
+    # Group by date and cumsum
+    cum_pv = pv.groupby(grouper).cumsum()
+    cum_v = vol.groupby(grouper).cumsum()
+
+    vwap = cum_pv / cum_v
+
+    # Replace infs and return with original index
+    vwap = vwap.replace([float('inf'), float('-inf')], float('nan'))
+    vwap.index = df.index
+    return vwap
 
 
 def write_futures_vwap_session(
@@ -841,30 +856,49 @@ def write_futures_vwap_session(
     *,
     run_id: Optional[str] = None,
     source: str = "session_vwap",
+    df15: Optional[pd.DataFrame] = None,
 ) -> int:
     """
-    Compute intraday session VWAP (IST day) from futures candles and upsert into
+    Compute Session VWAP (IST day) from futures candles and upsert into
     indicators.futures_frames as column 'vwap_session' per (symbol, interval=BASE_INTERVAL, ts).
+    If df15 is provided, computes over the full history (backfilling sessions).
     """
-    rows = _load_fut_intra_today(symbol)
-    if not rows:
+    if df15 is not None and not df15.empty:
+        vwap_series = _compute_session_vwap_series(df15)
+    else:
+        # Fallback to today-only
+        rows = _load_fut_intra_today(symbol)
+        if not rows:
+            return 0
+        df = pd.DataFrame(rows)
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        df = df.set_index("ts").sort_index()
+        for c in ("high", "low", "close", "volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        vwap_series = _compute_session_vwap_series(df)
+
+    if vwap_series.empty:
         return 0
 
-    series = _compute_session_vwap(rows)
     run_id = run_id or datetime.now(TZ).strftime("ind_%Y%m%d")
     table = _frames_table("futures")  # indicators.futures_frames
 
+    # Optimization: Calculate on full history for correctness, but only write recent data
+    # to avoid massive DB I/O on every run. Writing last 2 days covers "today" + margin.
+    write_cutoff = datetime.now(TZ) - timedelta(days=2)
+    vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+
     # Build bulk rows for UPSERT
     payload = []
-    for ts, vwap in series:
-        if vwap is None:
+    for ts, val in vwap_series_write.items():
+        if pd.isna(val):
             continue
         payload.append(
             (
                 symbol,
                 BASE_INTERVAL,
-                pd.to_datetime(ts, utc=True).to_pydatetime(),
-                float(vwap),
+                ts.to_pydatetime(),
+                float(val),
                 run_id,
                 source,
             )
@@ -898,23 +932,41 @@ def write_spot_vwap_session(
     *,
     run_id: Optional[str] = None,
     source: str = "session_vwap",
+    df15: Optional[pd.DataFrame] = None,
 ) -> int:
-    rows = _load_spot_intra_today(symbol)
-    if not rows:
+    if df15 is not None and not df15.empty:
+        vwap_series = _compute_session_vwap_series(df15)
+    else:
+        rows = _load_spot_intra_today(symbol)
+        if not rows:
+            return 0
+        df = pd.DataFrame(rows)
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        df = df.set_index("ts").sort_index()
+        for c in ("high", "low", "close", "volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        vwap_series = _compute_session_vwap_series(df)
+
+    if vwap_series.empty:
         return 0
-    # same math as futures
-    series = _compute_session_vwap(rows)
+
     run_id = run_id or datetime.now(TZ).strftime("ind_%Y%m%d")
+    table = "indicators.spot_frames"
+
+    # Optimization: Calculate on full history for correctness, but only write recent data
+    write_cutoff = datetime.now(TZ) - timedelta(days=2)
+    vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+
     payload = []
-    for ts, vwap in series:
-        if vwap is None:
+    for ts, val in vwap_series_write.items():
+        if pd.isna(val):
             continue
         payload.append(
             (
                 symbol,
                 BASE_INTERVAL,
-                pd.to_datetime(ts, utc=True).to_pydatetime(),
-                float(vwap),
+                ts.to_pydatetime(),
+                float(val),
                 run_id,
                 source,
             )
@@ -922,7 +974,6 @@ def write_spot_vwap_session(
     if not payload:
         return 0
 
-    table = "indicators.spot_frames"
     with get_db_connection() as conn, conn.cursor() as cur:
         pgx.execute_values(
             cur,
@@ -1599,12 +1650,12 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
 
                 # Session VWAP → frames for BOTH kinds (unchanged behavior)
                 if kind == "futures":
-                    wrote_vwap_sess = write_futures_vwap_session(sym)
+                    wrote_vwap_sess = write_futures_vwap_session(sym, df15=df15)
                     print(
                         f"[WRITE] futures:{sym} → vwap_session rows={wrote_vwap_sess}"
                     )
                 else:
-                    wrote_vwap_sess = write_spot_vwap_session(sym)
+                    wrote_vwap_sess = write_spot_vwap_session(sym, df15=df15)
                     print(
                         f"[WRITE] spot:{sym} → vwap_session rows={wrote_vwap_sess}"
                     )
@@ -1663,7 +1714,12 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
             try:
                 if hasattr(vpbb, "run"):
                     # correct entrypoint: handles kind='spot' | 'futures' | None (ini) safely
-                    vpbb.run(symbols=[sym], kind=kind)
+                    # Pass df15 to avoid re-fetching data
+                    try:
+                        vpbb.run(symbols=[sym], kind=kind, df=df15)
+                    except TypeError:
+                         # Fallback if vpbb.run doesn't support df yet
+                        vpbb.run(symbols=[sym], kind=kind)
                 else:
                     # fallback: call process_symbol with an explicit cfg.market_kind
                     if hasattr(vpbb, "load_vpbb_cfg") and hasattr(
@@ -1671,7 +1727,11 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
                     ):
                         _cfg = vpbb.load_vpbb_cfg()
                         _cfg.market_kind = kind  # force the side we're looping
-                        vpbb.process_symbol(sym, cfg=_cfg)
+                        # Try passing df if supported (we will update vpbb next)
+                        try:
+                            vpbb.process_symbol(sym, cfg=_cfg, df=df15)
+                        except TypeError:
+                            vpbb.process_symbol(sym, cfg=_cfg)
                     else:
                         print("[VPBB] no callable entry point found")
             except Exception as e:

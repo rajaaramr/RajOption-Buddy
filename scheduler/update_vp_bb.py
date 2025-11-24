@@ -900,11 +900,12 @@ def _write_vp_bb(
 # ---------------------------------------------------------------------
 # Driver (per symbol) — writes TAIL of bars per TF with reasons
 # ---------------------------------------------------------------------
-def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None) -> int:
+def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optional[pd.DataFrame] = None) -> int:
     """
     HYBRID VERSION:
     - Keeps original VP/BB math, gating, diagnostics and reasons.
     - Changes ONLY the I/O pattern: per-TF per-symbol bulk upserts instead of per-row.
+    - If 'df' is provided (15m OHLCV), it uses that instead of reloading from DB.
     """
     cfg = cfg or load_vpbb_cfg()
 
@@ -913,7 +914,11 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None) -> int:
 
     total = 0
     for kind in kinds_to_run:
-        df15 = load_intra(symbol, kind, lookback_days=cfg.lookback_days)
+        if df is not None and not df.empty:
+            df15 = df
+        else:
+            df15 = load_intra(symbol, kind, lookback_days=cfg.lookback_days)
+
         if df15.empty:
             print(f"⚠️ {kind}:{symbol} no intraday data in last {cfg.lookback_days}d")
             continue
@@ -1070,10 +1075,11 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None) -> int:
 # Batch entry
 # ---------------------------------------------------------------------
 def run(symbols: Optional[List[str]] = None, *, kind: Optional[str] = None,
-        uid: Optional[str] = None, status_cb=None) -> Dict[str, object]:
+        uid: Optional[str] = None, status_cb=None, df: Optional[pd.DataFrame] = None) -> Dict[str, object]:
     """
     Batch VP+BB. Caller (indicators_worker) provides the symbol list.
     - kind: override market_kind from cfg ('spot' or 'futures')
+    - df: Optional pre-loaded 15m dataframe. ONLY valid if len(symbols)==1.
     Returns {"rows": <int>, "last_ts": <datetime|None>}
     """
     cfg = load_vpbb_cfg()
@@ -1083,6 +1089,10 @@ def run(symbols: Optional[List[str]] = None, *, kind: Optional[str] = None,
     if not symbols:
         return {"rows": 0, "last_ts": None}
 
+    if df is not None and len(symbols) > 1:
+        print("⚠️ [VPBB] 'df' argument provided but multiple symbols passed. Ignoring df to avoid data mismatch.")
+        df = None
+
     if status_cb: status_cb("ZON_RESAMPLING")
 
     total = 0
@@ -1091,7 +1101,8 @@ def run(symbols: Optional[List[str]] = None, *, kind: Optional[str] = None,
         try:
             if status_cb: status_cb("ZON_COMPUTING_PROFILE")
             if status_cb: status_cb("ZON_COMPUTING_BB")
-            n = process_symbol(s, cfg=cfg)
+            # Pass df only if it's the correct context (though we already checked len=1)
+            n = process_symbol(s, cfg=cfg, df=df)
             total += n
             if status_cb: status_cb("ZON_WRITING")
             last_ts = last_ts or datetime.now(TZ)
