@@ -247,32 +247,21 @@ def _evaluate_interactions_vectorized(df_z: pd.DataFrame, interactions: Dict[str
 
     for name, expr in interactions.items():
         try:
-            # Sanitize expr for pd.eval (simple math only)
-            # If safe, use pd.eval or numexpr.
-            # For now, python eval with pandas Series overrides operators efficiently.
-            # We replace known metrics with 'local_dict["METRIC"]'
-
-            # Simple parsing: Replace keywords in Expr with local_dict lookups
-            # Token-based replacement to handle case sensitivity (e.g. MACD.hist vs MACD.HIST)
-            # We iterate over the tokens we extracted earlier
-            for t in tokens:
-                # Ignore numeric literals
-                if t.isnumeric():
-                    continue
-
-                # Try to find mapping
-                col = _COL_MAP.get(t.upper()) or t.lower()
-
-                # If we have this column in our dataframe, replace the token in the expression
-                if col in df_z.columns:
-                    # Simple replace might be risky if tokens are substrings of each other (e.g. A and AA)
-                    # But tokens come from split(), so likely distinct.
-                    # Ideally use regex or strict replacement, but .replace() is decent for these simple math expressions.
-                    mapped_expr = mapped_expr.replace(t, col)
+            # 1. Identify tokens
             tokens = [t for t in expr.replace("*"," ").replace("+"," ").replace("-"," ").replace("/"," ").split() if t.strip()]
 
-            # 2. Check data availability
-            if not all((t in local_dict or t.replace(".","_") in local_dict) for t in tokens if not t.isnumeric()):
+            # 2. Check data availability (Robust case-insensitive check)
+            is_avail = True
+            for t in tokens:
+                if t.isnumeric(): continue
+                # Map token to potential column name
+                col_key = _COL_MAP.get(t.upper()) or t.lower()
+                # Check if that column actually exists in our Z-score dataframe
+                if col_key not in df_z.columns:
+                    is_avail = False
+                    break
+
+            if not is_avail:
                 results[f"nli_{name.lower()}"] = 0.0
                 continue
 

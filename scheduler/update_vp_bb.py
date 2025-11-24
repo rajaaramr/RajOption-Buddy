@@ -190,7 +190,7 @@ def load_vpbb_cfg(ini_path: str = DEFAULT_INI) -> VPBBConfig:
     vwap_anchor_days = _as_int(_get_env("BB_VWAP_ANCHOR_DAYS", g(vb,"vwap_anchor_days")), dflt["vwap_anchor_days"])
     vp_decay_alpha   = _as_float(_get_env("VP_DECAY_ALPHA", g(vb,"vp_decay_alpha")), dflt["vp_decay_alpha"])
 
-    backfill_bars = _as_int(_get_env("VPBB_BACKFILL_BARS", None), 2000)
+    backfill_bars = _as_int(_get_env("VPBB_BACKFILL_BARS", g(vb, "BACKFILL_BARS")), 2000)
 
     return VPBBConfig(
         lookback_days=lookback_days, tf_list=tf_list, market_kind=market_kind,
@@ -965,12 +965,12 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                 # Better: Filter dftf index
 
             # 3. Select indices to process
+            tail_n = max(1, int(cfg.backfill_bars))
             if start_ts:
                 # Process from start_ts onwards
                 idxs = dftf.index[dftf.index >= start_ts]
             else:
                 # Fallback to tail backfill if no history
-                tail_n = max(1, int(cfg.backfill_bars))
                 idxs = dftf.index[-tail_n:]
 
             if len(idxs) == 0:
