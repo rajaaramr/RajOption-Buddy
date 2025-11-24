@@ -11,6 +11,7 @@ from typing import Any, Optional, Iterable, List, Tuple, Dict, TypedDict
 from datetime import datetime, timezone, timedelta
 import json, re
 
+import numpy as np
 import pandas as pd
 import psycopg2.extras as pgx
 
@@ -1132,12 +1133,12 @@ def write_vwap_extensions(
     # rolling 20 over the last 20 bars
     roll_v = df["volume"].rolling(20, min_periods=1).sum().replace(0, pd.NA)
     roll_pv = pv.rolling(20, min_periods=1).sum()
-    vwap_roll_20 = (roll_pv / roll_v).astype("float64")
+    vwap_roll_20 = (roll_pv / roll_v).replace({pd.NA: np.nan}).astype("float64")
 
     # cumulative since earliest loaded bar (stable across the window)
     cum_v = df["volume"].cumsum().replace(0, pd.NA)
     cum_pv = pv.cumsum()
-    vwap_cum = (cum_pv / cum_v).astype("float64")
+    vwap_cum = (cum_pv / cum_v).replace({pd.NA: np.nan}).astype("float64")
 
     table = _frames_table(kind)
     run_id = run_id or datetime.now(TZ).strftime("ind_%Y%m%d")
@@ -1360,13 +1361,13 @@ def _compute_tf_vwap_from_15m(
     tf["r20_vol"] = tf["vol"].rolling(20, min_periods=1).sum()
     tf["vwap_rolling_20_calc"] = (
         tf["r20_tpvol"] / tf["r20_vol"].replace(0, pd.NA)
-    ).astype("float64")
+    ).replace({pd.NA: np.nan}).astype("float64")
 
     tf["cum_tpvol"] = tf["tpvol"].cumsum()
     tf["cum_vol"] = tf["vol"].cumsum()
     tf["vwap_cumulative_calc"] = (
         tf["cum_tpvol"] / tf["cum_vol"].replace(0, pd.NA)
-    ).astype("float64")
+    ).replace({pd.NA: np.nan}).astype("float64")
 
     return tf[
         ["ts", "vwap_rolling_20_calc", "vwap_cumulative_calc"]
