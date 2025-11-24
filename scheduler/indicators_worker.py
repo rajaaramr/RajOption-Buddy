@@ -928,14 +928,12 @@ def write_futures_vwap_session(
         # assume we might need a bit more overlap or just rely on start_dt if it was explicit.
         # If last_ts is very recent, going back 4 hours is safe.
         write_cutoff = last_ts - timedelta(hours=4)
+        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
     else:
-        # No history? Write last 2 days as a safe default for "live" backfill
-        write_cutoff = datetime.now(TZ) - timedelta(days=2)
-
-    # Ensure we don't filter out everything if write_cutoff > last available data
-    # But if vwap_series is empty, we return 0 anyway.
-
-    vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+        # No history? Write EVERYTHING we calculated.
+        # The df15 passed in is already limited by load_intra_df or universe fetch logic (IND_LOOKBACK_DAYS).
+        # Do NOT arbitrarily clip to 2 days, or we get NULLs for history.
+        vwap_series_write = vwap_series
 
     # Build bulk rows for UPSERT
     payload = []
@@ -1013,10 +1011,10 @@ def write_spot_vwap_session(
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
+        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
     else:
-        write_cutoff = datetime.now(TZ) - timedelta(days=2)
-
-    vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+        # No history? Write FULL history provided in df15
+        vwap_series_write = vwap_series
 
     payload = []
     for ts, val in vwap_series_write.items():

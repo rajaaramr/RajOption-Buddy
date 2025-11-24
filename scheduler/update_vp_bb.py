@@ -992,8 +992,9 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                     # We'll process the very last bar just in case to keep 'last_updated' fresh.
                     idxs = dftf.index[-1:]
             else:
-                # Fallback to tail backfill if no history
-                idxs = dftf.index[-tail_n:]
+                # No start_ts (never run before) -> Process ALL available data, not just tail_n.
+                # tail_n is only for "live" optimization. First run must backfill.
+                idxs = dftf.index
 
             if len(idxs) == 0:
                 continue

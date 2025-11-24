@@ -416,11 +416,12 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
             df_res["nl_prob_final"] = df_res["nl_prob"]
             df_res["nl_score_final"] = df_res["nl_score"]
 
-        # 7. Upsert Batch (frames) – only tail
-        # If dataset is smaller than backfill request, write what we have
-        # Ensure we write at least one row if available to avoid gaps
-        tail_n = max(1, min(len(df_res), cfg.backfill_bars))
-        to_write = df_res.iloc[-tail_n:] if tail_n > 0 else df_res
+        # 7. Upsert Batch (frames)
+        # If cfg.backfill_bars is huge (e.g. 2000 from INI), we might process a lot.
+        # But typically we want to process everything we calculated if it's a backfill.
+        # The user reported gaps, so let's be generous: write all calculated rows.
+        # The DB upsert handles conflict.
+        to_write = df_res
 
         n = _bulk_upsert(kind, to_write, symbol, tf, "nl_run")
         total_rows += n
