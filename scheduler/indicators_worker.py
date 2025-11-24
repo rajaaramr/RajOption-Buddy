@@ -1212,42 +1212,6 @@ def write_pivots_all_tfs(
     if df15 is None or df15.empty:
         return 0
 
-    # --- Daily pivots from previous day's OHLC (IST) ---
-    df_ist = df15.copy()
-    df_ist.index = df_ist.index.tz_convert("Asia/Kolkata")
-    df_ist["date"] = df_ist.index.date
-
-    daily = df_ist.groupby("date").agg(
-        {"high": "max", "low": "min", "close": "last"}
-    ).dropna(subset=["high", "low", "close"])
-
-    if len(daily) < 2:
-        return 0
-
-    prev = daily.shift(1).dropna()  # pivots for D from OHLC of D-1
-
-    pp = (prev["high"] + prev["low"] + prev["close"]) / 3.0
-    r1 = 2 * pp - prev["low"]
-    s1 = 2 * pp - prev["high"]
-    r2 = pp + (prev["high"] - prev["low"])
-    s2 = pp - (prev["high"] - prev["low"])
-    r3 = prev["high"] + 2 * (pp - prev["low"])
-    s3 = prev["low"] - 2 * (prev["high"] - pp)
-
-    piv = pd.DataFrame(
-        {
-            "P": pp,
-            "R1": r1,
-            "S1": s1,
-            "R2": r2,
-            "S2": s2,
-            "R3": r3,
-            "S3": s3,
-        }
-    )
-    piv.index.name = "date"
-    piv_reset = piv.reset_index()  # date | P R1 S1 R2 S2 R3 S3
-
     table = _frames_table(kind)
     run_id = run_id or datetime.now(TZ).strftime("ind_%Y%m%d")
 
@@ -1259,27 +1223,43 @@ def write_pivots_all_tfs(
         if dftf is None or dftf.empty:
             continue
 
-        dftf_ist = dftf.copy()
-        dftf_ist.index = dftf_ist.index.tz_convert("Asia/Kolkata")
-        dftf_ist["date"] = dftf_ist.index.date
-        dftf_ist = dftf_ist.rename_axis("ts").reset_index()
+        # Calculate Timeframe-based Pivots (Previous Bar Logic)
+        # Shift HLC by 1 to get "Previous Bar" values
+        prev = dftf.shift(1)
 
-        merged = dftf_ist.merge(piv_reset, on="date", how="left")
-        merged = merged.dropna(subset=["P"])
-        if merged.empty:
+        # Standard Floor Pivot Formulas
+        pp = (prev["high"] + prev["low"] + prev["close"]) / 3.0
+        r1 = 2 * pp - prev["low"]
+        s1 = 2 * pp - prev["high"]
+        r2 = pp + (prev["high"] - prev["low"])
+        s2 = pp - (prev["high"] - prev["low"])
+        r3 = prev["high"] + 2 * (pp - prev["low"])
+        s3 = prev["low"] - 2 * (prev["high"] - pp)
+
+        # Combine into a DataFrame for easy iteration
+        # We use the index (ts) of the *current* bar, but values derived from *previous* bar
+        pivs = pd.DataFrame({
+            "P": pp, "R1": r1, "S1": s1,
+            "R2": r2, "S2": s2, "R3": r3, "S3": s3,
+            "close": dftf["close"]
+        }).dropna()
+
+        if pivs.empty:
             continue
 
-        r1_dist = ((merged["close"] - merged["R1"]) / merged["R1"]) * 100.0
-        s1_dist = ((merged["close"] - merged["S1"]) / merged["S1"]) * 100.0
+        # Calculate distances
+        # Distance % = (Close - Level) / Level * 100
+        r1_dist = ((pivs["close"] - pivs["R1"]) / pivs["R1"]) * 100.0
+        s1_dist = ((pivs["close"] - pivs["S1"]) / pivs["S1"]) * 100.0
 
-        for i, row in merged.iterrows():
-            ts = pd.to_datetime(row["ts"], utc=True).to_pydatetime()
+        for ts, row in pivs.iterrows():
+            ts_dt = pd.to_datetime(ts, utc=True).to_pydatetime()
             try:
                 all_rows.append(
                     (
                         symbol,
                         tf,
-                        ts,
+                        ts_dt,
                         float(row["P"]),
                         float(row["R1"]),
                         float(row["S1"]),
@@ -1287,8 +1267,8 @@ def write_pivots_all_tfs(
                         float(row["S2"]),
                         float(row["R3"]),
                         float(row["S3"]),
-                        float(r1_dist.iloc[i]),
-                        float(s1_dist.iloc[i]),
+                        float(r1_dist.loc[ts]),
+                        float(s1_dist.loc[ts]),
                         run_id,
                         source,
                     )
