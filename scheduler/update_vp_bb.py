@@ -965,18 +965,24 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
             }
 
             # --- Incremental / Tail Logic ---
-            # 1. Get last run TS for this TF (prefer start_dt if passed)
-            if start_dt:
-                last_ts = start_dt
-            else:
-                last_ts = _get_last_vpbb_ts(symbol, kind, tf)
+            # Check specifically for VPBB last run to detect if we need a full backfill
+            # even if the global 'start_dt' (from indicators) says we are up to date.
+            last_internal_ts = _get_last_vpbb_ts(symbol, kind, tf)
 
-            # 2. Determine start TS (overlap by 1-2 bars to catch updates)
-            start_ts = None
-            if last_ts:
+            if last_internal_ts is None:
+                # Never ran VPBB for this TF? Force full backfill.
+                start_ts = None
+            elif start_dt:
+                # We have history, so respect the incremental start_dt (global gate)
+                last_ts = start_dt
                 if last_ts.tzinfo is None:
                     last_ts = last_ts.replace(tzinfo=TZ)
-                # Go back ~4 hours to be safe (re-eval open/closing bars)
+                start_ts = last_ts - timedelta(hours=4)
+            else:
+                # Fallback to internal TS if no start_dt provided
+                last_ts = last_internal_ts
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=TZ)
                 start_ts = last_ts - timedelta(hours=4)
 
             # 3. Select indices to process

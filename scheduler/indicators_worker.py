@@ -1538,7 +1538,7 @@ NL_ENABLE = (
 
 
 # --- replace the old function with this ---
-def _call_nonlinear(symbol: str, kind: str) -> None:
+def _call_nonlinear(symbol: str, kind: str, start_dt: Optional[datetime] = None) -> None:
     """
     Optional nonlinear features. No webhook status, no return value required.
     Safe to no-op if module shape differs.
@@ -1549,15 +1549,21 @@ def _call_nonlinear(symbol: str, kind: str) -> None:
     try:
         # prefer the explicit API if present
         if hasattr(nlf, "process_symbol"):
-            nlf.process_symbol(symbol, kind=kind)  # type: ignore
+            try:
+                nlf.process_symbol(symbol, kind=kind, start_dt=start_dt)
+            except TypeError:
+                nlf.process_symbol(symbol, kind=kind)
             return
         # fall back to a more generic entry point
         if hasattr(nlf, "run"):
             # support either signature
             try:
-                nlf.run(symbol=symbol, kind=kind)  # type: ignore
+                nlf.run(symbol=symbol, kind=kind, start_dt=start_dt)  # type: ignore
             except TypeError:
-                nlf.run([symbol], kind=kind)  # type: ignore
+                try:
+                    nlf.run(symbol=symbol, kind=kind)
+                except TypeError:
+                    nlf.run([symbol], kind=kind)  # type: ignore
             return
         # nothing to do if the module has no entry point
         print(
@@ -1785,7 +1791,7 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
                     f"[VPBB ERROR] {sym} [{kind}] → {e}\n{traceback.format_exc()}"
                 )
             try:
-                _call_nonlinear(sym, kind=kind)
+                _call_nonlinear(sym, kind=kind, start_dt=last_run_at)
             except Exception as e:
                 print(
                     f"[Non_Linear ERROR] {sym} [{kind}] → {e}\n{traceback.format_exc()}"

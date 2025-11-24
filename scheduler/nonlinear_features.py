@@ -178,6 +178,18 @@ def _fetch_data_vectorized(symbol: str, kind: str, tf: str, lookback: int, requi
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     return df.set_index("ts").sort_index()
 
+def _get_last_nl_ts(symbol: str, kind: str, tf: str) -> Optional[datetime]:
+    """Fetch the latest timestamp that has valid NL data."""
+    tbl = _frames_table(kind)
+    # check nl_prob to see if we ran there
+    sql = f"SELECT max(ts) FROM {tbl} WHERE symbol=%s AND interval=%s AND nl_prob IS NOT NULL"
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (symbol, tf))
+        row = cur.fetchone()
+    if row and row[0]:
+        return pd.to_datetime(row[0], utc=True).to_pydatetime()
+    return None
+
 def _bulk_upsert(kind: str, df: pd.DataFrame, symbol: str, tf: str, run_id: str):
     """Bulk write results."""
     if df.empty: return 0
@@ -359,7 +371,7 @@ def _predict_vectorized(model_artifact, df_features: pd.DataFrame) -> pd.Series:
 
 # ====================== Main Pipeline ======================
 
-def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] = None, ini_path: str = DEFAULT_INI) -> int:
+def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] = None, ini_path: str = DEFAULT_INI, start_dt: Optional[datetime] = None) -> int:
     if cfg is None: cfg = _load_ini(ini_path)
     ml_cfg = _load_ml_cfg(ini_path)
 
@@ -381,10 +393,22 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
     required_metrics = list(required_metrics)
 
     for tf in cfg.tfs:
+        # Determine fetch limit based on start_dt or internal state
+        # Check if we have run before
+        last_internal_ts = _get_last_nl_ts(symbol, kind, tf)
+
+        limit_rows = cfg.lookback_n + cfg.backfill_bars
+
+        if last_internal_ts is None:
+            # Never ran? Fetch huge history (e.g. 5000 or more)
+            limit_rows = cfg.lookback_n + 10000
+        elif start_dt:
+            # Incremental mode: verify if start_dt is significantly newer
+            # If start_dt is provided, we assume we just need the tail.
+            pass
+
         # 2. Fetch Data (Bulk)
-        # We need lookback_n (for z-score) + backfill_bars (for processing)
-        fetch_rows = cfg.lookback_n + cfg.backfill_bars
-        df = _fetch_data_vectorized(symbol, kind, tf, fetch_rows, required_metrics)
+        df = _fetch_data_vectorized(symbol, kind, tf, limit_rows, required_metrics)
 
         # Relax check: if we have at least SOME data, try to compute (even if Z-score is initially NaN)
         if len(df) < 5: continue
@@ -453,7 +477,7 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
 
     return total_rows
 
-def run(symbols: Optional[List[str]] = None, kinds: Tuple[str,...] = ("futures","spot"), ini_path: str = DEFAULT_INI) -> int:
+def run(symbols: Optional[List[str]] = None, kinds: Tuple[str,...] = ("futures","spot"), ini_path: str = DEFAULT_INI, start_dt: Optional[datetime] = None) -> int:
     cfg = _load_ini(ini_path)
     if not symbols: return 0
 
@@ -461,7 +485,7 @@ def run(symbols: Optional[List[str]] = None, kinds: Tuple[str,...] = ("futures",
     for s in symbols:
         for k in kinds:
             try:
-                count += process_symbol(s, kind=k, cfg=cfg, ini_path=ini_path)
+                count += process_symbol(s, kind=k, cfg=cfg, ini_path=ini_path, start_dt=start_dt)
             except Exception as e:
                 print(f"❌ [NL] Error {s} {k}: {e}")
                 # traceback.print_exc()
