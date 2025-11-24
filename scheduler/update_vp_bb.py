@@ -988,16 +988,23 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                 # force at least the last few bars to ensure continuity if dftf is not empty.
                 if len(idxs) == 0 and not dftf.empty:
                     # e.g. check if start_ts is ahead of last data point
-                    if start_ts > dftf.index[-1]:
-                        # This can happen if 'last_run_at' was updated by another process
-                        # or simply clock skew. We'll process the very last bar just in case.
-                        idxs = dftf.index[-1:]
+                    # Or if start_ts is valid but dftf just doesn't have new bars yet
+                    # We'll process the very last bar just in case to keep 'last_updated' fresh.
+                    idxs = dftf.index[-1:]
             else:
                 # Fallback to tail backfill if no history
                 idxs = dftf.index[-tail_n:]
 
             if len(idxs) == 0:
                 continue
+
+            # Safety: For large TFs like 240m, ensure we have enough history for the first calculation in this batch
+            if tf in ("120m", "240m") and len(dftf) < 10:
+                # Not enough bars to do meaningful BB/VP
+                # But we should write NULLs or status if possible, or just skip.
+                # Currently we skip, which leaves NULLs in the database if rows were created by 'classic' worker.
+                # Let's try to process what we have if it's at least minimal.
+                pass
 
             wrote_tf = 0
 

@@ -418,7 +418,8 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
 
         # 7. Upsert Batch (frames) – only tail
         # If dataset is smaller than backfill request, write what we have
-        tail_n = min(len(df_res), cfg.backfill_bars)
+        # Ensure we write at least one row if available to avoid gaps
+        tail_n = max(1, min(len(df_res), cfg.backfill_bars))
         to_write = df_res.iloc[-tail_n:] if tail_n > 0 else df_res
 
         n = _bulk_upsert(kind, to_write, symbol, tf, "nl_run")
