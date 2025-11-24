@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -719,6 +719,17 @@ def compute_bb_metrics(
 # ---------------------------------------------------------------------
 # Upsert into frames (single-row helper)
 # ---------------------------------------------------------------------
+def _safe_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        # handle pd.NA or other NA types
+        if pd.isna(x):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
 def _upsert_vpbb_frames_row(
     symbol: str, kind: str, tf: str, ts: datetime,
     *,
@@ -758,17 +769,17 @@ def _upsert_vpbb_frames_row(
         ts,
         run_id,
         source,
-        vp_val,
-        vp_vah,
-        vp_poc,
-        bb_zone_top,
-        bb_zone_bot,
-        bb_score,
-        (diag or {}).get("vol_pct"),
-        (diag or {}).get("csv_z"),
-        (diag or {}).get("obv_delta"),
-        (diag or {}).get("block_len"),
-        (diag or {}).get("vwap"),
+        _safe_float(vp_val),
+        _safe_float(vp_vah),
+        _safe_float(vp_poc),
+        _safe_float(bb_zone_top),
+        _safe_float(bb_zone_bot),
+        _safe_float(bb_score),
+        _safe_float((diag or {}).get("vol_pct")),
+        _safe_float((diag or {}).get("csv_z")),
+        _safe_float((diag or {}).get("obv_delta")),
+        _safe_float((diag or {}).get("block_len")),
+        _safe_float((diag or {}).get("vwap")),
         vp_reason,
         bb_reason,
     ]
@@ -897,12 +908,12 @@ def _write_vp_bb(
 
     return _upsert_vpbb_frames_row(
         symbol, kind, tf, ts,
-        vp_val=(float(vp.val) if vp.val is not None else None),
-        vp_vah=(float(vp.vah) if vp.vah is not None else None),
-        vp_poc=(float(vp.poc) if vp.poc is not None else None),
-        bb_zone_top=(float(bb.zone_top) if bb.zone_top is not None else None),
-        bb_zone_bot=(float(bb.zone_bot) if bb.zone_bot is not None else None),
-        bb_score=(float(bb.score) if bb.score is not None else None),
+        vp_val=_safe_float(vp.val),
+        vp_vah=_safe_float(vp.vah),
+        vp_poc=_safe_float(vp.poc),
+        bb_zone_top=_safe_float(bb.zone_top),
+        bb_zone_bot=_safe_float(bb.zone_bot),
+        bb_score=_safe_float(bb.score),
         diag=diag,
         run_id=cfg.run_id,
         source=cfg.source,
@@ -1046,12 +1057,12 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                     ts_write,
                     os.getenv("RUN_ID", cfg.run_id),
                     "vp_bb_zone_levels",
-                    float(vp.val) if vp.val is not None else None,
-                    float(vp.vah) if vp.vah is not None else None,
-                    float(vp.poc) if vp.poc is not None else None,
-                    float(bb.zone_top) if bb.zone_top is not None else None,
-                    float(bb.zone_bot) if bb.zone_bot is not None else None,
-                    float(bb.score) if bb.score is not None else None,
+                    _safe_float(vp.val),
+                    _safe_float(vp.vah),
+                    _safe_float(vp.poc),
+                    _safe_float(bb.zone_top),
+                    _safe_float(bb.zone_bot),
+                    _safe_float(bb.score),
                     None,  # bb_diag_vol_pct
                     None,  # bb_diag_csv_z
                     None,  # bb_diag_obv_delta
@@ -1078,17 +1089,17 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                     ts_write,
                     cfg.run_id,
                     cfg.source,
-                    float(vp.val) if vp.val is not None else None,
-                    float(vp.vah) if vp.vah is not None else None,
-                    float(vp.poc) if vp.poc is not None else None,
-                    float(bb.zone_top) if bb.zone_top is not None else None,
-                    float(bb.zone_bot) if bb.zone_bot is not None else None,
-                    float(bb.score) if bb.score is not None else None,
-                    diag.get("vol_pct"),
-                    diag.get("csv_z"),
-                    diag.get("obv_delta"),
-                    diag.get("block_len"),
-                    diag.get("vwap"),
+                    _safe_float(vp.val),
+                    _safe_float(vp.vah),
+                    _safe_float(vp.poc),
+                    _safe_float(bb.zone_top),
+                    _safe_float(bb.zone_bot),
+                    _safe_float(bb.score),
+                    _safe_float(diag.get("vol_pct")),
+                    _safe_float(diag.get("csv_z")),
+                    _safe_float(diag.get("obv_delta")),
+                    _safe_float(diag.get("block_len")),
+                    _safe_float(diag.get("vwap")),
                     vp_reason,
                     bb_reason,
                 ))

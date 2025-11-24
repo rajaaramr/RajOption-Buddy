@@ -458,6 +458,10 @@ def build_indicator_rows(
     if df5 is None or df5.empty:
         return rows, stats
 
+    # Helper for safe float conversion
+    def _safe_floats(s: pd.Series) -> pd.Series:
+        return s.replace({pd.NA: np.nan}).astype("float64")
+
     for tf in P["TF_LIST"]:  # type: ignore
         if tf not in TF_TO_OFFSET:
             continue
@@ -470,7 +474,7 @@ def build_indicator_rows(
         # --- RSI ---
         if P["METRICS"].get("RSI", True):
             try:
-                s = rsi(dftf["close"], P["RSI_LEN"]).dropna()
+                s = _safe_floats(rsi(dftf["close"], P["RSI_LEN"])).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, "RSI")
                 if cutoff is not None:
                     s = s[s.index > cutoff]
@@ -485,7 +489,7 @@ def build_indicator_rows(
         # --- RMI ---
         if P["METRICS"].get("RMI", True):
             try:
-                s = rmi(dftf["close"], P["RMI_LEN"], P["RMI_MOM"]).dropna()
+                s = _safe_floats(rmi(dftf["close"], P["RMI_LEN"], P["RMI_MOM"])).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, "RMI")
                 if cutoff is not None:
                     s = s[s.index > cutoff]
@@ -502,7 +506,7 @@ def build_indicator_rows(
             try:
                 line, sig, hist = macd(dftf["close"], P["MACD_FAST"], P["MACD_SLOW"], P["MACD_SIG"])
                 for name, series in [("MACD.macd", line), ("MACD.signal", sig), ("MACD.hist", hist)]:
-                    s = series.dropna()
+                    s = _safe_floats(series).dropna()
                     cutoff = get_last_ts(symbol, kind, tf, name)
                     if cutoff is not None:
                         s = s[s.index > cutoff]
@@ -520,7 +524,7 @@ def build_indicator_rows(
             try:
                 adx_v, plus_di, minus_di = adx(dftf["high"], dftf["low"], dftf["close"], P["ADX_LEN"])
                 for name, series in [("ADX", adx_v), ("DI+", plus_di), ("DI-", minus_di)]:
-                    s = series.dropna()
+                    s = _safe_floats(series).dropna()
                     cutoff = get_last_ts(symbol, kind, tf, name)
                     if cutoff is not None:
                         s = s[s.index > cutoff]
@@ -535,7 +539,7 @@ def build_indicator_rows(
         # --- ROC ---
         if P["METRICS"].get("ROC", True):
             try:
-                s = roc(dftf["close"], P["ROC_LEN"]).dropna()
+                s = _safe_floats(roc(dftf["close"], P["ROC_LEN"])).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, "ROC")
                 if cutoff is not None:
                     s = s[s.index > cutoff]
@@ -550,7 +554,7 @@ def build_indicator_rows(
         # --- ATR ---
         if P["METRICS"].get("ATR", True):
             try:
-                s = atr(dftf["high"], dftf["low"], dftf["close"], P["ATR_LEN"]).dropna()
+                s = _safe_floats(atr(dftf["high"], dftf["low"], dftf["close"], P["ATR_LEN"])).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, "ATR")
                 if cutoff is not None:
                     s = s[s.index > cutoff]
@@ -565,7 +569,7 @@ def build_indicator_rows(
         # --- MFI ---
         if P["METRICS"].get("MFI", True):
             try:
-                s = mfi(dftf["high"], dftf["low"], dftf["close"], dftf["volume"], P["MFI_LEN"]).dropna()
+                s = _safe_floats(mfi(dftf["high"], dftf["low"], dftf["close"], dftf["volume"], P["MFI_LEN"])).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, "MFI")
                 if cutoff is not None:
                     s = s[s.index > cutoff]
@@ -582,7 +586,7 @@ def build_indicator_rows(
         if ema_list:
             try:
                 for L in ema_list:
-                    series = ema(dftf["close"], int(L)).dropna()
+                    series = _safe_floats(ema(dftf["close"], int(L))).dropna()
                     metric = f"EMA.{int(L)}"
                     cutoff = get_last_ts(symbol, kind, tf, metric)
                     if cutoff is not None:
@@ -609,7 +613,7 @@ def build_indicator_rows(
             ).dropna(how="all")
 
             for metric_col, series in obv_df.items():
-                s = series.dropna()
+                s = _safe_floats(series).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, metric_col)
                 if cutoff is not None:
                     s = s[s.index > cutoff]
@@ -638,7 +642,7 @@ def build_indicator_rows(
         # --- CCI ---
         if P["METRICS"].get("CCI", True):
             try:
-                s = cci(dftf["high"], dftf["low"], dftf["close"], int(P["CCI_LEN"])).dropna()
+                s = _safe_floats(cci(dftf["high"], dftf["low"], dftf["close"], int(P["CCI_LEN"]))).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, "CCI")
                 if cutoff is not None:
                     s = s[s.index > cutoff]
@@ -662,7 +666,7 @@ def build_indicator_rows(
                     int(P.get("STOCH_SMOOTH", 3)),
                 )
                 for name, series in [("STOCH.K", k), ("STOCH.D", d)]:
-                    s = series.dropna()
+                    s = _safe_floats(series).dropna()
                     cutoff = get_last_ts(symbol, kind, tf, name)
                     if cutoff is not None:
                         s = s[s.index > cutoff]
@@ -682,12 +686,12 @@ def build_indicator_rows(
         # --- PSAR ---
         if P["METRICS"].get("PSAR", True):
             try:
-                s = psar(
+                s = _safe_floats(psar(
                     dftf["high"],
                     dftf["low"],
                     af_step=float(P["PSAR_STEP"]),
                     af_max=float(P["PSAR_MAX"]),
-                ).dropna()
+                )).dropna()
                 cutoff = get_last_ts(symbol, kind, tf, "PSAR")
                 if cutoff is not None:
                     s = s[s.index > cutoff]

@@ -196,7 +196,16 @@ def _bulk_upsert(kind: str, df: pd.DataFrame, symbol: str, tf: str, run_id: str)
     values = []
     for ts, row in df.iterrows():
         vals = [symbol, tf, ts.to_pydatetime(), run_id, "nonlinear"]
-        vals.extend([None if pd.isna(row[c]) else float(row[c]) for c in cols_to_write])
+
+        # Safer float conversion for bulk insert
+        def _sf(x):
+            try:
+                if pd.isna(x): return None
+                return float(x)
+            except Exception:
+                return None
+
+        vals.extend([_sf(row[c]) for c in cols_to_write])
         values.append(tuple(vals))
 
     # Construct ON CONFLICT update
