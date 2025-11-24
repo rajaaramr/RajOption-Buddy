@@ -386,7 +386,8 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
         fetch_rows = cfg.lookback_n + cfg.backfill_bars
         df = _fetch_data_vectorized(symbol, kind, tf, fetch_rows, required_metrics)
 
-        if len(df) < cfg.lookback_n: continue
+        # Relax check: if we have at least SOME data, try to compute (even if Z-score is initially NaN)
+        if len(df) < 5: continue
 
         # 3. Calculate Z-Scores (Vectorized)
         df_z = _calculate_zscores(df, cfg.lookback_n)
@@ -401,7 +402,6 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
         df_res["nl_score"] = (df_res["nl_prob"] * 100.0).round(2)
 
         # 6. ML Prediction (Vectorized)
-                # 6. ML Prediction (Vectorized)
         probs_ml = None
         if model_artifact:
             # Note: here you're passing RAW df; if your model was trained on z-scores,
@@ -417,7 +417,10 @@ def process_symbol(symbol: str, kind: str = "futures", cfg: Optional[NLConfig] =
             df_res["nl_score_final"] = df_res["nl_score"]
 
         # 7. Upsert Batch (frames) – only tail
-        to_write = df_res.iloc[-cfg.backfill_bars:]
+        # If dataset is smaller than backfill request, write what we have
+        tail_n = min(len(df_res), cfg.backfill_bars)
+        to_write = df_res.iloc[-tail_n:] if tail_n > 0 else df_res
+
         n = _bulk_upsert(kind, to_write, symbol, tf, "nl_run")
         total_rows += n
 

@@ -1138,14 +1138,15 @@ def write_vwap_extensions(
     pv = tp * df["volume"]
 
     # rolling 20 over the last 20 bars
-    roll_v = df["volume"].rolling(20, min_periods=1).sum().replace(0, pd.NA)
+    roll_v = df["volume"].rolling(20, min_periods=1).sum()
     roll_pv = pv.rolling(20, min_periods=1).sum()
-    vwap_roll_20 = (roll_pv / roll_v).replace({pd.NA: np.nan}).astype("float64")
+    # Avoid div/0 by replacing 0 with NaN before division
+    vwap_roll_20 = (roll_pv / roll_v.replace(0, np.nan)).astype("float64")
 
     # cumulative since earliest loaded bar (stable across the window)
-    cum_v = df["volume"].cumsum().replace(0, pd.NA)
+    cum_v = df["volume"].cumsum()
     cum_pv = pv.cumsum()
-    vwap_cum = (cum_pv / cum_v).replace({pd.NA: np.nan}).astype("float64")
+    vwap_cum = (cum_pv / cum_v.replace(0, np.nan)).astype("float64")
 
     table = _frames_table(kind)
     run_id = run_id or datetime.now(TZ).strftime("ind_%Y%m%d")
@@ -1367,14 +1368,14 @@ def _compute_tf_vwap_from_15m(
     tf["r20_tpvol"] = tf["tpvol"].rolling(20, min_periods=1).sum()
     tf["r20_vol"] = tf["vol"].rolling(20, min_periods=1).sum()
     tf["vwap_rolling_20_calc"] = (
-        tf["r20_tpvol"] / tf["r20_vol"].replace(0, pd.NA)
-    ).replace({pd.NA: np.nan}).astype("float64")
+        tf["r20_tpvol"] / tf["r20_vol"].replace(0, np.nan)
+    ).astype("float64")
 
     tf["cum_tpvol"] = tf["tpvol"].cumsum()
     tf["cum_vol"] = tf["vol"].cumsum()
     tf["vwap_cumulative_calc"] = (
-        tf["cum_tpvol"] / tf["cum_vol"].replace(0, pd.NA)
-    ).replace({pd.NA: np.nan}).astype("float64")
+        tf["cum_tpvol"] / tf["cum_vol"].replace(0, np.nan)
+    ).astype("float64")
 
     return tf[
         ["ts", "vwap_rolling_20_calc", "vwap_cumulative_calc"]
