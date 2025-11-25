@@ -913,27 +913,28 @@ def write_futures_vwap_session(
 
     # Optimization: Calculate on full history for correctness, but only write recent data
     # to avoid massive DB I/O on every run.
-    if start_dt:
-        last_ts = start_dt
-    else:
-        last_ts = _get_last_vwap_ts(symbol, "futures")
 
-    if last_ts:
-        # Overlap by ~4 hours to ensure continuity and catch late updates/re-calcs
-        # Ensure last_ts is offset-aware (it should be from universe fetch)
+    # Check internal DB state for VWAP specifically, to detect if we need a full backfill
+    # even if the global 'start_dt' says we are up to date.
+    last_internal_ts = _get_last_vwap_ts(symbol, "futures")
+
+    if last_internal_ts is None:
+        # Never wrote VWAP session? Force full backfill.
+        vwap_series_write = vwap_series
+    elif start_dt:
+        # We have history, so respect the incremental start_dt (global gate)
+        last_ts = start_dt
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
-
-        # Safety: if last_ts is unreasonably close to now (less than 15m),
-        # assume we might need a bit more overlap or just rely on start_dt if it was explicit.
-        # If last_ts is very recent, going back 4 hours is safe.
         write_cutoff = last_ts - timedelta(hours=4)
         vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
     else:
-        # No history? Write EVERYTHING we calculated.
-        # The df15 passed in is already limited by load_intra_df or universe fetch logic (IND_LOOKBACK_DAYS).
-        # Do NOT arbitrarily clip to 2 days, or we get NULLs for history.
-        vwap_series_write = vwap_series
+        # Fallback to internal TS if no start_dt provided
+        last_ts = last_internal_ts
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=TZ)
+        write_cutoff = last_ts - timedelta(hours=4)
+        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
 
     # Build bulk rows for UPSERT
     payload = []
@@ -1002,19 +1003,25 @@ def write_spot_vwap_session(
     table = "indicators.spot_frames"
 
     # Optimization: Calculate on full history for correctness, but only write recent data
-    if start_dt:
-        last_ts = start_dt
-    else:
-        last_ts = _get_last_vwap_ts(symbol, "spot")
 
-    if last_ts:
+    # Check internal DB state for VWAP specifically
+    last_internal_ts = _get_last_vwap_ts(symbol, "spot")
+
+    if last_internal_ts is None:
+        # Never wrote VWAP session? Force full backfill.
+        vwap_series_write = vwap_series
+    elif start_dt:
+        last_ts = start_dt
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
         vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
     else:
-        # No history? Write FULL history provided in df15
-        vwap_series_write = vwap_series
+        last_ts = last_internal_ts
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=TZ)
+        write_cutoff = last_ts - timedelta(hours=4)
+        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
 
     payload = []
     for ts, val in vwap_series_write.items():
