@@ -934,45 +934,69 @@ def write_futures_vwap_session(
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
-        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+    # We must write this series for ALL tracked timeframes (resampled).
+    # If we only write to 15m, the other TFs will have NULL vwap_session.
 
-    # Build bulk rows for UPSERT
-    payload = []
-    for ts, val in vwap_series_write.items():
-        if pd.isna(val):
+    # The 'vwap_series' is on 15m base. We filter it for writing.
+    base_series_write = vwap_series[vwap_series.index >= write_cutoff]
+
+    total_written = 0
+
+    for tf in PIVOT_TFS:  # ["15m", "30m", "60m", ...]
+        if tf == "15m":
+            target_series = base_series_write
+        else:
+            # Resample the 15m VWAP to target TF (taking last value in bin)
+            rule = _PIVOT_TF_TO_OFFSET.get(tf)
+            if not rule: continue
+            # We resample the *original* filtered slice or the full slice?
+            # Better to resample the full 'vwap_series' then slice by write_cutoff
+            # to ensure the first bar in the window is correct (resampling edge effects).
+            resampled = vwap_series.resample(rule, label='right', closed='right').last().dropna()
+            target_series = resampled[resampled.index >= write_cutoff]
+
+        if target_series.empty:
             continue
-        payload.append(
-            (
-                symbol,
-                BASE_INTERVAL,
-                ts.to_pydatetime(),
-                float(val),
-                run_id,
-                source,
-            )
-        )
-    if not payload:
-        return 0
 
-    # Upsert on (symbol, interval, ts): set vwap_session, run_id, source, updated_at
-    with get_db_connection() as conn, conn.cursor() as cur:
-        pgx.execute_values(
-            cur,
-            f"""
-            INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
-            VALUES %s
-            ON CONFLICT (symbol, interval, ts)
-            DO UPDATE SET
-              vwap_session = EXCLUDED.vwap_session,
-              run_id       = EXCLUDED.run_id,
-              source       = EXCLUDED.source,
-              updated_at   = NOW()
-            """,
-            payload,
-            page_size=1000,
-        )
-        conn.commit()
-    return len(payload)
+        payload = []
+        for ts, val in target_series.items():
+            if pd.isna(val):
+                continue
+            payload.append(
+                (
+                    symbol,
+                    tf,
+                    ts.to_pydatetime(),
+                    float(val),
+                    run_id,
+                    source,
+                )
+            )
+
+        if not payload:
+            continue
+
+        # Upsert on (symbol, interval, ts)
+        with get_db_connection() as conn, conn.cursor() as cur:
+            pgx.execute_values(
+                cur,
+                f"""
+                INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
+                VALUES %s
+                ON CONFLICT (symbol, interval, ts)
+                DO UPDATE SET
+                  vwap_session = EXCLUDED.vwap_session,
+                  run_id       = EXCLUDED.run_id,
+                  source       = EXCLUDED.source,
+                  updated_at   = NOW()
+                """,
+                payload,
+                page_size=1000,
+            )
+            conn.commit()
+        total_written += len(payload)
+
+    return total_written
 
 
 def write_spot_vwap_session(
@@ -1021,43 +1045,61 @@ def write_spot_vwap_session(
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
-        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+    # We must write this series for ALL tracked timeframes (resampled).
 
-    payload = []
-    for ts, val in vwap_series_write.items():
-        if pd.isna(val):
+    total_written = 0
+
+    for tf in PIVOT_TFS:  # ["15m", "30m", "60m", ...]
+        if tf == "15m":
+            # 15m is base
+            target_series = vwap_series[vwap_series.index >= write_cutoff]
+        else:
+            # Resample the full 15m VWAP to target TF then slice
+            rule = _PIVOT_TF_TO_OFFSET.get(tf)
+            if not rule: continue
+            resampled = vwap_series.resample(rule, label='right', closed='right').last().dropna()
+            target_series = resampled[resampled.index >= write_cutoff]
+
+        if target_series.empty:
             continue
-        payload.append(
-            (
-                symbol,
-                BASE_INTERVAL,
-                ts.to_pydatetime(),
-                float(val),
-                run_id,
-                source,
-            )
-        )
-    if not payload:
-        return 0
 
-    with get_db_connection() as conn, conn.cursor() as cur:
-        pgx.execute_values(
-            cur,
-            f"""
-            INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
-            VALUES %s
-            ON CONFLICT (symbol, interval, ts)
-            DO UPDATE SET
-              vwap_session = EXCLUDED.vwap_session,
-              run_id       = EXCLUDED.run_id,
-              source       = EXCLUDED.source,
-              updated_at   = NOW()
-            """,
-            payload,
-            page_size=1000,
-        )
-        conn.commit()
-    return len(payload)
+        payload = []
+        for ts, val in target_series.items():
+            if pd.isna(val):
+                continue
+            payload.append(
+                (
+                    symbol,
+                    tf,
+                    ts.to_pydatetime(),
+                    float(val),
+                    run_id,
+                    source,
+                )
+            )
+        if not payload:
+            continue
+
+        with get_db_connection() as conn, conn.cursor() as cur:
+            pgx.execute_values(
+                cur,
+                f"""
+                INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
+                VALUES %s
+                ON CONFLICT (symbol, interval, ts)
+                DO UPDATE SET
+                  vwap_session = EXCLUDED.vwap_session,
+                  run_id       = EXCLUDED.run_id,
+                  source       = EXCLUDED.source,
+                  updated_at   = NOW()
+                """,
+                payload,
+                page_size=1000,
+            )
+            conn.commit()
+        total_written += len(payload)
+
+    return total_written
 
 
 def _load_recent_15m(

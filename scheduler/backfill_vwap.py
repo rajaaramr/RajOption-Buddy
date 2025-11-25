@@ -17,6 +17,15 @@ from utils.db import get_db_connection
 
 TZ = timezone.utc
 
+_PIVOT_TF_TO_OFFSET = {
+    "15m":  "15min",
+    "30m":  "30min",
+    "60m":  "60min",
+    "90m":  "90min",
+    "120m": "120min",
+    "240m": "240min",
+}
+
 def _table_name(kind: str) -> str:
     return "market.spot_candles" if kind == "spot" else "market.futures_candles"
 
@@ -90,47 +99,63 @@ def backfill_vwap_for_symbol(symbol: str, kind: str) -> int:
     run_id = f"bk_vwap_{datetime.now(TZ).strftime('%Y%m%d')}"
     source = "backfill_vwap"
 
-    # Prepare payload - ALL rows
-    payload = []
-    for ts, val in vwap_series.items():
-        if pd.isna(val):
+    total_upserted = 0
+
+    # Loop through all target timeframes to write resampled VWAP
+    for tf, offset in _PIVOT_TF_TO_OFFSET.items():
+        if tf == "15m":
+            # Use the 15m series directly
+            target_series = vwap_series
+        else:
+            # Resample to target TF, taking the last value in the bin (right-labeled)
+            # Since vwap_session is cumulative intraday, the end-of-bar value is correct.
+            target_series = vwap_series.resample(offset, label='right', closed='right').last().dropna()
+
+        if target_series.empty:
             continue
-        payload.append(
-            (
-                symbol,
-                "15m",
-                ts.to_pydatetime(),
-                float(val),
-                run_id,
-                source,
+
+        payload = []
+        for ts, val in target_series.items():
+            if pd.isna(val):
+                continue
+            payload.append(
+                (
+                    symbol,
+                    tf,
+                    ts.to_pydatetime(),
+                    float(val),
+                    run_id,
+                    source,
+                )
             )
-        )
 
-    if not payload:
-        return 0
+        if not payload:
+            continue
 
-    print(f"[WRITE] Upserting {len(payload)} rows for {kind}:{symbol} into {table}...")
+        print(f"[WRITE] Upserting {len(payload)} rows for {kind}:{symbol} [{tf}] into {table}...")
 
-    with get_db_connection() as conn, conn.cursor() as cur:
-        pgx.execute_values(
-            cur,
-            f"""
-            INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
-            VALUES %s
-            ON CONFLICT (symbol, interval, ts)
-            DO UPDATE SET
-              vwap_session = EXCLUDED.vwap_session,
-              run_id       = EXCLUDED.run_id,
-              source       = EXCLUDED.source,
-              updated_at   = NOW()
-            """,
-            payload,
-            page_size=2000,
-        )
-        conn.commit()
+        with get_db_connection() as conn, conn.cursor() as cur:
+            pgx.execute_values(
+                cur,
+                f"""
+                INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
+                VALUES %s
+                ON CONFLICT (symbol, interval, ts)
+                DO UPDATE SET
+                  vwap_session = EXCLUDED.vwap_session,
+                  run_id       = EXCLUDED.run_id,
+                  source       = EXCLUDED.source,
+                  updated_at   = NOW()
+                """,
+                payload,
+                page_size=2000,
+            )
+            conn.commit()
 
-    print(f"[DONE] {kind}:{symbol}")
-    return len(payload)
+        total_upserted += len(payload)
+
+    print(f"[DONE] {kind}:{symbol} -> {total_upserted} total rows across TFs")
+    return total_upserted
 
 def fetch_universe_symbols() -> List[str]:
     with get_db_connection() as conn, conn.cursor() as cur:
