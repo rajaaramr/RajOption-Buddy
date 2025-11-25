@@ -921,6 +921,12 @@ def write_futures_vwap_session(
     if last_internal_ts is None:
         # Never wrote VWAP session? Force full backfill.
         vwap_series_write = vwap_series
+        # Set write_cutoff to the beginning of time or the first timestamp to avoid UnboundLocalError below
+        # used for base_series_write
+        if not vwap_series.empty:
+            write_cutoff = vwap_series.index[0]
+        else:
+            write_cutoff = datetime.now(TZ) - timedelta(days=3650)
     elif start_dt:
         # We have history, so respect the incremental start_dt (global gate)
         last_ts = start_dt
@@ -1034,6 +1040,10 @@ def write_spot_vwap_session(
     if last_internal_ts is None:
         # Never wrote VWAP session? Force full backfill.
         vwap_series_write = vwap_series
+        if not vwap_series.empty:
+            write_cutoff = vwap_series.index[0]
+        else:
+            write_cutoff = datetime.now(TZ) - timedelta(days=3650)
     elif start_dt:
         last_ts = start_dt
         if last_ts.tzinfo is None:
