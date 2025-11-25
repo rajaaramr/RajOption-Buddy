@@ -11,6 +11,8 @@ from . import config
 
 def get_engine():
     """Builds and returns a SQLAlchemy engine for PostgreSQL."""
+    if config.DB_PASSWORD is None:
+        raise ValueError("Database password is not set. Please set the PGPASSWORD environment variable.")
     return create_engine(config.CONN_STR)
 
 def load_all_tables(engine):
@@ -75,6 +77,13 @@ def load_all_tables(engine):
     tables["symbol_meta"] = pd.read_sql(
         f"SELECT symbol, industry_name, sector_name FROM {config.TABLES['symbol_meta']}",
         engine,
+    )
+
+    # TradingView intraday chart dump
+    tables["intraday_chart_dump"] = pd.read_sql(
+        f"SELECT * FROM {config.TABLES['intraday_chart_dump']}",
+        engine,
+        parse_dates=["trade_date"],
     )
 
     print("[INFO] All tables loaded successfully.")

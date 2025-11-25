@@ -79,13 +79,18 @@ def build_features(data_dict):
     df = merge_indicator(df, data_dict["spot_frames"], '30m', {"adx": "adx_SPOT_30m"})
     df = merge_indicator(df, data_dict["spot_frames"], '60m', {"mfi_14": "mfi_14_SPOT_60m"})
 
-    # --- Add daily option features ---
+    # --- Add daily option and TradingView features ---
+    df["trade_date"] = pd.to_datetime(df["ts"]).dt.normalize()
+
     df_opt_sym_day = _build_daily_option_features(data_dict["daily_options"])
     if not df_opt_sym_day.empty:
-        df["trade_date"] = pd.to_datetime(df["ts"]).dt.normalize()
         df = pd.merge(df, df_opt_sym_day, on=["trade_date", "symbol"], how="left")
-        df = df.drop(columns=["trade_date"])
 
+    df_tv_features = _build_tradingview_features(data_dict["intraday_chart_dump"])
+    if not df_tv_features.empty:
+        df = pd.merge(df, df_tv_features, on=["trade_date", "symbol"], how="left")
+
+    df = df.drop(columns=["trade_date"])
     df = df.sort_values(["ts", "symbol"]).set_index(["ts", "symbol"])
 
     # --- Lag Features & Targets ---
@@ -99,9 +104,11 @@ def build_features(data_dict):
 
     # --- New ATR Feature ---
     df_spot_for_atr = spot_15.set_index(['ts', 'symbol']).sort_index()
-    df['atr_14_SPOT_15m'] = df_spot_for_atr.groupby(level='symbol').apply(
+    atr_series = df_spot_for_atr.groupby(level='symbol').apply(
         lambda x: _calculate_atr(x.reset_index(), period=14)
-    ).reset_index(level=0, drop=True)
+    )
+    atr_series.name = 'atr_14_SPOT_15m'
+    df = df.join(atr_series, on=['ts', 'symbol'])
 
     # --- Targets (multi-class) ---
     df["target"] = 0 # Sideways
@@ -137,6 +144,34 @@ def build_features(data_dict):
 
     print("[INFO] Feature engineering complete.")
     return df
+
+def _build_tradingview_features(df_tv):
+    """Pivots the TradingView data to create daily features."""
+    if df_tv.empty:
+        return pd.DataFrame()
+
+    # Define columns to pivot
+    indicator_cols = [
+        'tech_rating', 'rvol', 'gap_pct', 'vwap', 'vwma', 'ema_10', 'rsi_14', 'mfi_14', 'adx_14'
+    ]
+
+    # Pivot the table
+    df_pivot = df_tv.pivot_table(
+        index=['trade_date', 'symbol'],
+        columns='interval',
+        values=indicator_cols
+    ).reset_index()
+
+    # Flatten the multi-level column index
+    df_pivot.columns = [f"{col[0]}_{col[1]}" if col[1] else col[0] for col in df_pivot.columns]
+
+    # Handle categorical 'tech_rating'
+    for col in [c for c in df_pivot.columns if 'tech_rating' in c]:
+        # Simple mapping: Strong Buy=2, Buy=1, Neutral=0, Sell=-1, Strong Sell=-2
+        rating_map = {"Strong buy": 2, "Buy": 1, "Neutral": 0, "Sell": -1, "Strong sell": -2}
+        df_pivot[col] = df_pivot[col].map(rating_map).fillna(0)
+
+    return df_pivot
 
 def _build_daily_option_features(df_daily_opt):
     """Helper to build daily option features."""

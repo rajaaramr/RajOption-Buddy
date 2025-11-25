@@ -27,8 +27,8 @@ def prepare_data_for_training(df_features):
 
     # Drop columns that are not features
     cols_to_drop = [
-        'target', 'future_close_SPOT', 'future_ret', 'close_SPOT', 'high', 'low', 'volume_SPOT',
-        'close_FUT', 'oi_FUT', 'interval', 'h-l', 'h-pc', 'l-pc'
+        'target', 'future_close_SPOT', 'future_ret', 'high', 'low', 'volume_SPOT',
+        'oi_FUT', 'interval', 'h-l', 'h-pc', 'l-pc'
     ]
     # Drop original indicator columns that now have lagged versions
     lag_cols_originals = [c for c in df_features.columns if "_SPOT_" in c or "_FUT_" in c and "_LAG_" not in c]

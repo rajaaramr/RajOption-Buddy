@@ -8,7 +8,7 @@ import os
 
 # --- Database Configuration ---
 DB_USER = os.getenv("PGUSER", "postgres")
-DB_PASSWORD = os.getenv("PGPASSWORD", "Ajantha18")
+DB_PASSWORD = os.getenv("PGPASSWORD")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("PGPORT", "5432")
 DB_NAME = os.getenv("PGDATABASE", "TradeHub18")
@@ -24,6 +24,7 @@ TABLES = {
     "daily_futures": "raw_ingest.daily_futures",
     "daily_options": "raw_ingest.daily_options",
     "symbol_meta": "reference.symbol_meta",
+    "intraday_chart_dump": "raw_ingest.intraday_chart_dump",
     "ml_signals": "indicators.ml_signals_2pct_4h",
 }
 
