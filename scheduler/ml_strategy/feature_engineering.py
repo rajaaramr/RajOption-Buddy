@@ -55,19 +55,23 @@ def build_features(data_dict):
     # --- Initial merge ---
     spot_15 = data_dict["spot_candles"].rename(columns={"close": "close_SPOT", "volume": "volume_SPOT"})
     fut_15 = data_dict["futures_candles"].rename(columns={"close": "close_FUT", "oi": "oi_FUT"})
-    df = pd.merge(spot_15, fut_15, on=["ts", "symbol"], how="inner")
+    # Drop the interval column from futures to avoid the merge conflict
+    df = pd.merge(spot_15, fut_15.drop(columns=['interval']), on=["ts", "symbol"], how="inner")
 
     # --- Merge indicators ---
     def merge_indicator(df, indicator_df, interval, cols_to_rename):
         ind = indicator_df[indicator_df["interval"] == interval].copy()
         ind = ind.rename(columns=cols_to_rename)
 
+        # Columns to merge: the keys of cols_to_rename + the join keys
+        merge_cols = ["ts", "symbol"] + list(cols_to_rename.values())
+
         # Forward-fill for larger timeframes
         if interval != '15m':
             ind = ind.set_index(["symbol", "ts"]).sort_index()
             ind = ind.groupby(level="symbol").ffill().reset_index()
 
-        return pd.merge(df, ind, on=["ts", "symbol"], how="left")
+        return pd.merge(df, ind[merge_cols], on=["ts", "symbol"], how="left")
 
     df = merge_indicator(df, data_dict["futures_frames"], '15m',
                          {"stoch_k": "stoch_k_FUT_15m", "macd_hist": "macd_hist_FUT_15m", "bb_score": "bb_score_FUT_15m"})
