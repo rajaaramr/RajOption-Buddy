@@ -103,12 +103,16 @@ def build_features(data_dict):
     df["future_ret"] = (df["future_close_SPOT"] / df["close_SPOT"]) - 1.0
 
     # --- New ATR Feature ---
-    df_spot_for_atr = spot_15.set_index(['ts', 'symbol']).sort_index()
-    atr_series = df_spot_for_atr.rename(columns={'close_SPOT': 'close'}).groupby(level='symbol').apply(
-        lambda x: _calculate_atr(x.reset_index(), period=14)
-    )
-    atr_series.name = 'atr_14_SPOT_15m'
-    df = df.join(atr_series, on=['ts', 'symbol'])
+    # To fix the KeyError and the subsequent ValueError, we perform the ATR calculation
+    # on a temporary dataframe that has the original 'close' column name and a simple index,
+    # then we merge the result back.
+    atr_df = spot_15.copy()
+    atr_df = atr_df.rename(columns={'close_SPOT': 'close'})
+    atr_df['atr_14_SPOT_15m'] = atr_df.groupby('symbol').apply(
+        lambda x: _calculate_atr(x, period=14)
+    ).reset_index(level=0, drop=True)
+
+    df = pd.merge(df, atr_df[['ts', 'symbol', 'atr_14_SPOT_15m']], on=['ts', 'symbol'], how='left')
 
     # --- Targets (multi-class) ---
     df["target"] = 0 # Sideways
