@@ -104,7 +104,7 @@ def build_features(data_dict):
 
     # --- New ATR Feature ---
     df_spot_for_atr = spot_15.set_index(['ts', 'symbol']).sort_index()
-    atr_series = df_spot_for_atr.groupby(level='symbol').apply(
+    atr_series = df_spot_for_atr.rename(columns={'close_SPOT': 'close'}).groupby(level='symbol').apply(
         lambda x: _calculate_atr(x.reset_index(), period=14)
     )
     atr_series.name = 'atr_14_SPOT_15m'
