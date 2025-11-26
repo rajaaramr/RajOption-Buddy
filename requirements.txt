@@ -1,0 +1,7 @@
+pandas
+xgboost
+lightgbm
+scikit-learn
+sqlalchemy
+psycopg2-binary
+featuretools
