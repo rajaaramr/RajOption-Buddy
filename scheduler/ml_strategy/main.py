@@ -44,7 +44,7 @@ def run_pipeline(tune=False):
 
     # 5. Save Signals to Database
     if predictions:
-        model_trainer.save_signals_to_db(predictions, engine)
+        model_trainer.save_signals_to_db(predictions, engine, table_name="ml_signals_multiclass")
     else:
         print("[WARN] No predictions were generated. Skipping database write.")
 

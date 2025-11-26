@@ -139,9 +139,9 @@ def train_and_evaluate(X_train, X_test, y_train, y_test, best_xgb_params=None, b
 
     return models, predictions
 
-def save_signals_to_db_automated(predictions_dict, engine):
+def save_signals_to_db(predictions_dict, engine, table_name):
     """
-    Saves signals from the automated pipeline to the database.
+    Combines model predictions and saves them to the specified database table.
     """
     df_signals = pd.concat(predictions_dict.values(), axis=1)
 
@@ -157,49 +157,17 @@ def save_signals_to_db_automated(predictions_dict, engine):
 
     df_to_write = df_signals.reset_index()
 
-    table_name = config.TABLES['ml_signals_automated']
-    print(f"\n[INFO] Writing {len(df_to_write)} signals to {table_name}...")
+    full_table_name = f"indicators.{table_name}"
+    print(f"\n[INFO] Writing {len(df_to_write)} signals to {full_table_name}...")
 
     try:
         df_to_write.to_sql(
             table_name,
             engine,
             schema="indicators",
-            if_exists="replace",
-            index=False
-        )
-        print(f"[INFO] Successfully wrote signals to {table_name}")
-    except Exception as e:
-        print(f"[ERROR] Failed to write signals to database: {e}")
-
-def save_signals_to_db(predictions_dict, engine):
-    """
-    Combines model predictions and saves them to the database.
-    """
-    df_signals = pd.concat(predictions_dict.values(), axis=1)
-
-    # Add a simple combined signal
-    df_signals['prob_up_combined'] = df_signals[['prob_up_xgb', 'prob_up_lgb']].mean(axis=1)
-    df_signals['prob_down_combined'] = df_signals[['prob_down_xgb', 'prob_down_lgb']].mean(axis=1)
-
-    df_signals['ml_direction'] = 0
-    up_mask = (df_signals['prob_up_combined'] > 0.6) & (df_signals['prob_up_combined'] > df_signals['prob_down_combined'])
-    down_mask = (df_signals['prob_down_combined'] > 0.6) & (df_signals['prob_down_combined'] > df_signals['prob_up_combined'])
-    df_signals.loc[up_mask, 'ml_direction'] = 1
-    df_signals.loc[down_mask, 'ml_direction'] = -1
-
-    df_to_write = df_signals.reset_index()
-
-    print(f"\n[INFO] Writing {len(df_to_write)} signals to the database...")
-
-    try:
-        df_to_write.to_sql(
-            "ml_signals_multiclass", # New table name
-            engine,
-            schema="indicators",
             if_exists="replace", # Use replace for backtesting, append/upsert for production
             index=False
         )
-        print("[INFO] Successfully wrote signals to indicators.ml_signals_multiclass")
+        print(f"[INFO] Successfully wrote signals to {full_table_name}")
     except Exception as e:
         print(f"[ERROR] Failed to write signals to database: {e}")

@@ -62,7 +62,7 @@ def run_pipeline(tune=False):
 
     # 8. Save Signals to a New Database Table
     if predictions:
-        model_trainer.save_signals_to_db_automated(predictions, engine)
+        model_trainer.save_signals_to_db(predictions, engine, table_name=config.TABLES['ml_signals_automated'])
 
     print("\n======================================================")
     print("=== Automated ML Strategy Pipeline Run Finished ===")

@@ -19,7 +19,6 @@ def create_entityset(data_dict):
         dataframe=data_dict["fo_daily_unified"].rename(columns={'nse_code': 'symbol'}),
         index="symbol",
         time_index="trade_date",
-        secondary_time_index={"last_updated": ["fno_prev_total_oi"]} # Example of secondary time index
     )
 
     # Add other daily dataframes

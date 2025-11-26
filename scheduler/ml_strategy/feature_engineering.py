@@ -80,7 +80,7 @@ def build_features(data_dict):
     df = merge_indicator(df, data_dict["spot_frames"], '60m', {"mfi_14": "mfi_14_SPOT_60m"})
 
     # --- Add daily option and TradingView features ---
-    df["trade_date"] = pd.to_datetime(df["ts"]).dt.normalize()
+    df["trade_date"] = pd.to_datetime(df["ts"]).dt.normalize().dt.tz_localize(None)
 
     df_opt_sym_day = _build_daily_option_features(data_dict["daily_options"])
     if not df_opt_sym_day.empty:
