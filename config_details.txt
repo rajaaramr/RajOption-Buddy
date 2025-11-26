@@ -1,0 +1,19 @@
+# Please configure the following environment variables to connect to your PostgreSQL database.
+# The script will use these variables to build the connection string.
+
+# Your PostgreSQL username
+PGUSER=your_username
+
+# Your PostgreSQL password
+PGPASSWORD=your_password
+
+# The hostname or IP address of your PostgreSQL server
+# This needs to be reachable from the environment where the code is running.
+# 'localhost' will not work unless the database is running in the same container.
+DB_HOST=your_database_host_or_ip
+
+# The port your PostgreSQL server is running on (default is 5432)
+PGPORT=5432
+
+# The name of the database to connect to
+PGDATABASE=TradeHub18
