@@ -150,6 +150,10 @@ def _build_tradingview_features(df_tv):
     if df_tv.empty:
         return pd.DataFrame()
 
+    # First, handle the categorical 'tech_rating' column
+    rating_map = {"Strong buy": 2, "Buy": 1, "Neutral": 0, "Sell": -1, "Strong sell": -2}
+    df_tv['tech_rating'] = df_tv['tech_rating'].map(rating_map).fillna(0)
+
     # Define columns to pivot
     indicator_cols = [
         'tech_rating', 'rvol', 'gap_pct', 'vwap', 'vwma', 'ema_10', 'rsi_14', 'mfi_14', 'adx_14'
@@ -164,12 +168,6 @@ def _build_tradingview_features(df_tv):
 
     # Flatten the multi-level column index
     df_pivot.columns = [f"{col[0]}_{col[1]}" if col[1] else col[0] for col in df_pivot.columns]
-
-    # Handle categorical 'tech_rating'
-    for col in [c for c in df_pivot.columns if 'tech_rating' in c]:
-        # Simple mapping: Strong Buy=2, Buy=1, Neutral=0, Sell=-1, Strong Sell=-2
-        rating_map = {"Strong buy": 2, "Buy": 1, "Neutral": 0, "Sell": -1, "Strong sell": -2}
-        df_pivot[col] = df_pivot[col].map(rating_map).fillna(0)
 
     return df_pivot
 

@@ -58,7 +58,11 @@ def run_pipeline(tune=False):
     print(f"[INFO] Data prepared for training. Train shape: {X_train.shape}, Test shape: {X_test.shape}")
 
     # 7. Train and Evaluate Models
-    models, predictions = model_trainer.train_and_evaluate(X_train, X_test, y_train, y_test)
+    best_xgb_params, best_lgb_params = None, None
+    if tune:
+        best_xgb_params, best_lgb_params = model_trainer.hyperparameter_tuning(X_train, y_train)
+
+    models, predictions = model_trainer.train_and_evaluate(X_train, X_test, y_train, y_test, best_xgb_params, best_lgb_params)
 
     # 8. Save Signals to a New Database Table
     if predictions:
