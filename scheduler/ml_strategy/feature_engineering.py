@@ -103,16 +103,13 @@ def build_features(data_dict):
     df["future_ret"] = (df["future_close_SPOT"] / df["close_SPOT"]) - 1.0
 
     # --- New ATR Feature ---
-    # To fix the KeyError and the subsequent ValueError, we perform the ATR calculation
-    # on a temporary dataframe that has the original 'close' column name and a simple index,
-    # then we merge the result back.
-    atr_df = spot_15.copy()
-    atr_df = atr_df.rename(columns={'close_SPOT': 'close'})
-    atr_df['atr_14_SPOT_15m'] = atr_df.groupby('symbol').apply(
-        lambda x: _calculate_atr(x, period=14)
-    ).reset_index(level=0, drop=True)
+    # Correctly calculate ATR in a vectorized way to avoid index corruption
+    high_low = df['high'] - df['low']
+    high_prev_close = (df['high'] - df.groupby(level='symbol')['close_SPOT'].shift(1)).abs()
+    low_prev_close = (df['low'] - df.groupby(level='symbol')['close_SPOT'].shift(1)).abs()
 
-    df = pd.merge(df, atr_df[['ts', 'symbol', 'atr_14_SPOT_15m']], on=['ts', 'symbol'], how='left')
+    tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+    df['atr_14_SPOT_15m'] = tr.groupby(level='symbol').rolling(window=14).mean().reset_index(level=0, drop=True)
 
     # --- Targets (multi-class) ---
     df["target"] = 0 # Sideways
