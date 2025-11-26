@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -719,6 +719,17 @@ def compute_bb_metrics(
 # ---------------------------------------------------------------------
 # Upsert into frames (single-row helper)
 # ---------------------------------------------------------------------
+def _safe_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        # handle pd.NA or other NA types
+        if pd.isna(x):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
 def _upsert_vpbb_frames_row(
     symbol: str, kind: str, tf: str, ts: datetime,
     *,
@@ -758,17 +769,17 @@ def _upsert_vpbb_frames_row(
         ts,
         run_id,
         source,
-        vp_val,
-        vp_vah,
-        vp_poc,
-        bb_zone_top,
-        bb_zone_bot,
-        bb_score,
-        (diag or {}).get("vol_pct"),
-        (diag or {}).get("csv_z"),
-        (diag or {}).get("obv_delta"),
-        (diag or {}).get("block_len"),
-        (diag or {}).get("vwap"),
+        _safe_float(vp_val),
+        _safe_float(vp_vah),
+        _safe_float(vp_poc),
+        _safe_float(bb_zone_top),
+        _safe_float(bb_zone_bot),
+        _safe_float(bb_score),
+        _safe_float((diag or {}).get("vol_pct")),
+        _safe_float((diag or {}).get("csv_z")),
+        _safe_float((diag or {}).get("obv_delta")),
+        _safe_float((diag or {}).get("block_len")),
+        _safe_float((diag or {}).get("vwap")),
         vp_reason,
         bb_reason,
     ]
@@ -897,12 +908,12 @@ def _write_vp_bb(
 
     return _upsert_vpbb_frames_row(
         symbol, kind, tf, ts,
-        vp_val=(float(vp.val) if vp.val is not None else None),
-        vp_vah=(float(vp.vah) if vp.vah is not None else None),
-        vp_poc=(float(vp.poc) if vp.poc is not None else None),
-        bb_zone_top=(float(bb.zone_top) if bb.zone_top is not None else None),
-        bb_zone_bot=(float(bb.zone_bot) if bb.zone_bot is not None else None),
-        bb_score=(float(bb.score) if bb.score is not None else None),
+        vp_val=_safe_float(vp.val),
+        vp_vah=_safe_float(vp.vah),
+        vp_poc=_safe_float(vp.poc),
+        bb_zone_top=_safe_float(bb.zone_top),
+        bb_zone_bot=_safe_float(bb.zone_bot),
+        bb_score=_safe_float(bb.score),
         diag=diag,
         run_id=cfg.run_id,
         source=cfg.source,
@@ -954,18 +965,24 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
             }
 
             # --- Incremental / Tail Logic ---
-            # 1. Get last run TS for this TF (prefer start_dt if passed)
-            if start_dt:
-                last_ts = start_dt
-            else:
-                last_ts = _get_last_vpbb_ts(symbol, kind, tf)
+            # Check specifically for VPBB last run to detect if we need a full backfill
+            # even if the global 'start_dt' (from indicators) says we are up to date.
+            last_internal_ts = _get_last_vpbb_ts(symbol, kind, tf)
 
-            # 2. Determine start TS (overlap by 1-2 bars to catch updates)
-            start_ts = None
-            if last_ts:
+            if last_internal_ts is None:
+                # Never ran VPBB for this TF? Force full backfill.
+                start_ts = None
+            elif start_dt:
+                # We have history, so respect the incremental start_dt (global gate)
+                last_ts = start_dt
                 if last_ts.tzinfo is None:
                     last_ts = last_ts.replace(tzinfo=TZ)
-                # Go back ~4 hours to be safe (re-eval open/closing bars)
+                start_ts = last_ts - timedelta(hours=4)
+            else:
+                # Fallback to internal TS if no start_dt provided
+                last_ts = last_internal_ts
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=TZ)
                 start_ts = last_ts - timedelta(hours=4)
 
             # 3. Select indices to process
@@ -973,12 +990,28 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
             if start_ts:
                 # Process from start_ts onwards
                 idxs = dftf.index[dftf.index >= start_ts]
+                # FALLBACK: If index selection returns empty (e.g. data is slightly behind start_ts),
+                # force at least the last few bars to ensure continuity if dftf is not empty.
+                if len(idxs) == 0 and not dftf.empty:
+                    # e.g. check if start_ts is ahead of last data point
+                    # Or if start_ts is valid but dftf just doesn't have new bars yet
+                    # We'll process the very last bar just in case to keep 'last_updated' fresh.
+                    idxs = dftf.index[-1:]
             else:
-                # Fallback to tail backfill if no history
-                idxs = dftf.index[-tail_n:]
+                # No start_ts (never run before) -> Process ALL available data, not just tail_n.
+                # tail_n is only for "live" optimization. First run must backfill.
+                idxs = dftf.index
 
             if len(idxs) == 0:
                 continue
+
+            # Safety: For large TFs like 240m, ensure we have enough history for the first calculation in this batch
+            if tf in ("120m", "240m") and len(dftf) < 10:
+                # Not enough bars to do meaningful BB/VP
+                # But we should write NULLs or status if possible, or just skip.
+                # Currently we skip, which leaves NULLs in the database if rows were created by 'classic' worker.
+                # Let's try to process what we have if it's at least minimal.
+                pass
 
             wrote_tf = 0
 
@@ -1046,12 +1079,12 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                     ts_write,
                     os.getenv("RUN_ID", cfg.run_id),
                     "vp_bb_zone_levels",
-                    float(vp.val) if vp.val is not None else None,
-                    float(vp.vah) if vp.vah is not None else None,
-                    float(vp.poc) if vp.poc is not None else None,
-                    float(bb.zone_top) if bb.zone_top is not None else None,
-                    float(bb.zone_bot) if bb.zone_bot is not None else None,
-                    float(bb.score) if bb.score is not None else None,
+                    _safe_float(vp.val),
+                    _safe_float(vp.vah),
+                    _safe_float(vp.poc),
+                    _safe_float(bb.zone_top),
+                    _safe_float(bb.zone_bot),
+                    _safe_float(bb.score),
                     None,  # bb_diag_vol_pct
                     None,  # bb_diag_csv_z
                     None,  # bb_diag_obv_delta
@@ -1078,17 +1111,17 @@ def process_symbol(symbol: str, *, cfg: Optional[VPBBConfig] = None, df: Optiona
                     ts_write,
                     cfg.run_id,
                     cfg.source,
-                    float(vp.val) if vp.val is not None else None,
-                    float(vp.vah) if vp.vah is not None else None,
-                    float(vp.poc) if vp.poc is not None else None,
-                    float(bb.zone_top) if bb.zone_top is not None else None,
-                    float(bb.zone_bot) if bb.zone_bot is not None else None,
-                    float(bb.score) if bb.score is not None else None,
-                    diag.get("vol_pct"),
-                    diag.get("csv_z"),
-                    diag.get("obv_delta"),
-                    diag.get("block_len"),
-                    diag.get("vwap"),
+                    _safe_float(vp.val),
+                    _safe_float(vp.vah),
+                    _safe_float(vp.poc),
+                    _safe_float(bb.zone_top),
+                    _safe_float(bb.zone_bot),
+                    _safe_float(bb.score),
+                    _safe_float(diag.get("vol_pct")),
+                    _safe_float(diag.get("csv_z")),
+                    _safe_float(diag.get("obv_delta")),
+                    _safe_float(diag.get("block_len")),
+                    _safe_float(diag.get("vwap")),
                     vp_reason,
                     bb_reason,
                 ))

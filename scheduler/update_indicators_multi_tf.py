@@ -86,8 +86,10 @@ def cci(h: pd.Series, l: pd.Series, c: pd.Series, n:int=20) -> pd.Series:
     tp  = (h + l + c) / 3.0
     sma = tp.rolling(n, min_periods=n).mean()
     md  = (tp - sma).abs().rolling(n, min_periods=n).mean()
-    denom = 0.015 * md.replace(0, pd.NA)
-    return ((tp - sma) / denom).astype("float64")
+    denom = 0.015 * md.replace(0, np.nan)
+    # If md is 0 (no deviation), CCI is theoretically 0 or undefined.
+    # We'll treat it as 0 to keep continuity.
+    return ((tp - sma) / denom).fillna(0.0).astype("float64")
 
 def stoch_kd(
     h: pd.Series,
@@ -118,9 +120,12 @@ def stoch_kd(
 
     ll = l.rolling(k_len, min_periods=k_len).min()
     hh = h.rolling(k_len, min_periods=k_len).max()
-    rng = (hh - ll).replace(0, pd.NA)
+    rng = (hh - ll).replace(0, np.nan) # Avoid pd.NA for numeric division
 
     k_raw = ((c - ll) / rng) * 100.0
+    # If range is 0, %K is typically undefined or 50/100. We can fill 50.
+    k_raw = k_raw.fillna(50.0)
+
     k = k_raw.rolling(smooth_k, min_periods=1).mean()
     d = k.rolling(d_len, min_periods=1).mean()
 
@@ -376,18 +381,22 @@ def rsi(close: pd.Series, n:int) -> pd.Series:
     gain = d.clip(lower=0.0)
     loss = (-d).clip(lower=0.0)
     ag = gain.ewm(alpha=1.0/n, adjust=False).mean()
-    al = loss.ewm(alpha=1.0/n, adjust=False).mean().replace(0, pd.NA)
-    rs = ag/al
-    return 100 - (100/(1+rs))
+    al = loss.ewm(alpha=1.0/n, adjust=False).mean()
+    # If loss is 0, RSI is 100. Avoid pd.NA
+    rs = ag / al.replace(0, np.nan)
+    res = 100.0 - 100.0/(1.0 + rs)
+    return res.fillna(100.0).astype("float64")
 
 def rmi(close: pd.Series, n:int, mom:int) -> pd.Series:
     m = close.diff(mom)
     gain = m.clip(lower=0.0)
     loss = (-m).clip(lower=0.0)
     ag = gain.ewm(alpha=1.0/n, adjust=False).mean()
-    al = loss.ewm(alpha=1.0/n, adjust=False).mean().replace(0, pd.NA)
-    rs = ag/al
-    return 100 - (100/(1+rs))
+    al = loss.ewm(alpha=1.0/n, adjust=False).mean()
+    # If loss is 0, RMI is 100
+    rs = ag / al.replace(0, np.nan)
+    res = 100.0 - 100.0/(1.0 + rs)
+    return res.fillna(100.0).astype("float64")
 
 def macd(close: pd.Series, fast:int, slow:int, sig:int):
     line = ema(close, fast) - ema(close, slow)
@@ -413,9 +422,19 @@ def adx(h: pd.Series, l: pd.Series, c: pd.Series, n:int):
     plus_dm  = ((up > dn) & (up > 0.0)) * up
     minus_dm = ((dn > up) & (dn > 0.0)) * dn
     atr_s = true_range(h, l, c).ewm(alpha=1.0/n, adjust=False).mean()
-    plus_di  = 100.0 * (plus_dm.ewm(alpha=1.0/n, adjust=False).mean()  / atr_s.replace(0, np.nan))
-    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0/n, adjust=False).mean() / atr_s.replace(0, np.nan))
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100.0
+
+    # Avoid div/0. If ATR is 0, DI is 0.
+    atr_safe = atr_s.replace(0, np.nan)
+    plus_di  = 100.0 * (plus_dm.ewm(alpha=1.0/n, adjust=False).mean()  / atr_safe)
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0/n, adjust=False).mean() / atr_safe)
+
+    plus_di = plus_di.fillna(0.0)
+    minus_di = minus_di.fillna(0.0)
+
+    sum_di = (plus_di + minus_di).replace(0, np.nan)
+    dx = ((plus_di - minus_di).abs() / sum_di) * 100.0
+    dx = dx.fillna(0.0)
+
     adx_v = dx.ewm(alpha=1.0/n, adjust=False).mean()
     return adx_v.astype("float64"), plus_di.astype("float64"), minus_di.astype("float64")
 
@@ -427,8 +446,14 @@ def mfi(h: pd.Series, l: pd.Series, c: pd.Series, v: pd.Series, n:int) -> pd.Ser
     mf = tp*v
     pos = (tp>tp.shift(1))*mf
     neg = (tp<tp.shift(1))*mf
-    mr = pos.rolling(n, min_periods=n).sum() / (neg.rolling(n, min_periods=n).sum().replace(0,pd.NA))
-    return 100 - (100/(1+mr))
+
+    neg_sum = neg.rolling(n, min_periods=n).sum()
+    pos_sum = pos.rolling(n, min_periods=n).sum()
+
+    # If neg flow is 0, MFI is 100
+    mr = pos_sum / neg_sum.replace(0, np.nan)
+    res = 100.0 - 100.0/(1.0 + mr)
+    return res.fillna(100.0).astype("float64")
 
 # ---------------------------------------------------------------------
 # PUBLIC (pure): build rows for indicators.values
@@ -457,6 +482,10 @@ def build_indicator_rows(
 
     if df5 is None or df5.empty:
         return rows, stats
+
+    # Helper for safe float conversion (still used for generic safety)
+    def _safe_floats(s: pd.Series) -> pd.Series:
+        return s.replace({pd.NA: np.nan}).astype("float64")
 
     for tf in P["TF_LIST"]:  # type: ignore
         if tf not in TF_TO_OFFSET:
