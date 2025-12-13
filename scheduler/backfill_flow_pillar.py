@@ -7,9 +7,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import psycopg2.extras
 
 from utils.db import get_db_connection
-from pillars.common import TZ, BaseCfg, write_values, maybe_trim_last_bar
+from pillars.common import TZ, BaseCfg, maybe_trim_last_bar
 
 from flow.pillar.flow_pillar_optimized import process_symbol_vectorized
 from flow.pillar.flow_features_optimized import load_daily_futures, load_external_metrics
@@ -99,6 +100,48 @@ def parse_dt(s: str) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
     return dt
+
+def write_values_direct(rows: List[tuple]) -> None:
+    """
+    Writes rows directly to indicators.values, bypassing pillars.common.
+    Expected row format: (symbol, kind, tf, ts, metric, val, ctx, run_id, source)
+    """
+    if not rows:
+        return
+
+    # Dedupe locally
+    dedup = {}
+    for r in rows:
+        # Key: (symbol, kind, tf, ts, metric)
+        key = (r[0], r[1], r[2], r[3], r[4])
+        dedup[key] = r
+    rows_to_write = list(dedup.values())
+
+    sql = """
+        INSERT INTO indicators.values
+        (symbol, market_type, interval, ts, metric, val, context, run_id, source)
+        VALUES %s
+        ON CONFLICT (symbol, market_type, interval, ts, metric)
+        DO UPDATE SET
+            val = EXCLUDED.val,
+            context = EXCLUDED.context,
+            run_id = EXCLUDED.run_id,
+            source = EXCLUDED.source,
+            updated_at = NOW()
+    """
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur, sql, rows_to_write, page_size=1000
+                )
+            conn.commit()
+            # print(f"[DB] Committed {len(rows_to_write)} rows to indicators.values")
+    except Exception as e:
+        print(f"[DB ERROR] Failed to write rows: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ============================================================
 # Candle loader
@@ -245,7 +288,8 @@ def backfill_symbol_vectorized(
         batch_size = flush_every
         for i in range(0, len(rows), batch_size):
             chunk = rows[i:i+batch_size]
-            write_values(chunk)
+            # Use direct writer
+            write_values_direct(chunk)
 
         total_rows += len(rows)
         print(f"[{symbol}] {tf}: Wrote {len(rows)} rows.")
