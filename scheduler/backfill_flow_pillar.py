@@ -71,6 +71,7 @@ def update_flow_last_ts(symbol: str, kind: str, mode: str, last_ts: datetime) ->
     if last_ts.tzinfo is None:
         last_ts = last_ts.replace(tzinfo=TZ)
 
+    print(f"[AUDIT] Updating {col} for {symbol} to {last_ts}")
     sql = f"UPDATE {UNIVERSE_TABLE} SET {col}=%s WHERE symbol=%s"
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(sql, (last_ts, symbol))

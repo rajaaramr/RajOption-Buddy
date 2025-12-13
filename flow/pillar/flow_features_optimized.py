@@ -44,6 +44,11 @@ class FlowFeatureEngine:
         return df
 
     def _compute_price_vol_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Robustness: Ensure float types
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+
         # Price changes
         df['price_change'] = df['close'].diff()
         df['price_hh'] = (df['high'] > df['high'].shift(1))
