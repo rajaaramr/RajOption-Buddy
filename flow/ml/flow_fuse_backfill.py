@@ -147,6 +147,7 @@ def sigmoid(x: float, center: float = 0.5, steepness: float = 12.0) -> float:
 # ---------- DB loaders ----------
 def _load_rules_and_ml(
     market_type: str,
+    ml_market_type: str,
     tf: str,
     cutoff,
     target_name: str,
@@ -186,7 +187,7 @@ def _load_rules_and_ml(
                 prob_up
             FROM indicators.ml_pillars
             WHERE ts >= %(cutoff)s
-              AND market_type = %(market_type)s
+              AND market_type = %(ml_market_type)s
               AND tf          = %(interval)s
               AND pillar      = 'flow'
               AND target_name = %(target_name)s
@@ -203,7 +204,6 @@ def _load_rules_and_ml(
         FROM rules r
         LEFT JOIN ml m
           ON  m.symbol      = r.symbol
-          AND m.market_type = r.market_type
           AND m.tf          = r.interval
           AND m.ts          = r.ts
         WHERE m.prob_up IS NOT NULL
@@ -217,6 +217,7 @@ def _load_rules_and_ml(
             params={
                 "cutoff": cutoff,
                 "market_type": market_type,
+                "ml_market_type": ml_market_type,
                 "interval": tf,      # we pass "15m", maps to both interval & tf
                 "target_name": target_name,
                 "version": version,
@@ -325,8 +326,14 @@ def _run_backfill(
     buckets = _load_flow_calibration(target_name)
     print(f"[FLOW_FUSE] Loaded {len(buckets)} calibration buckets for {target_name}")
 
+    # ML is typically trained on FUTURES data even if we are scoring SPOT symbols
+    # So we force ml_market_type='futures' to ensure we find the ML scores.
+    # (Unless there is a specific 'spot' model, but usually one model covers all).
+    ml_market_type = "futures"
+
     df = _load_rules_and_ml(
         market_type=market_type,
+        ml_market_type=ml_market_type,
         tf=tf,
         cutoff=cutoff,
         target_name=target_name,
