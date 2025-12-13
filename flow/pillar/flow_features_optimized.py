@@ -235,13 +235,16 @@ class FlowFeatureEngine:
         """
         Merges external metrics (like FNO.pcr) pivoted onto the timeframe.
         """
-        # Metric df is long: ts, metric, val
+        # Metric df is long: ts, metric, val, interval
         # Pivot to wide: ts, [metric_names]
 
         # Ensure timestamps match (assuming metrics are on same interval, e.g. 15m)
         # If metrics are 15m, direct join.
 
-        pivoted = metrics_df.pivot(index='ts', columns='metric', values='val')
+        # Drop duplicates just in case
+        metrics_dedup = metrics_df.drop_duplicates(subset=['ts', 'metric'])
+
+        pivoted = metrics_dedup.pivot(index='ts', columns='metric', values='val')
 
         # Join
         # Use asof merge or left join?
@@ -273,8 +276,9 @@ def load_external_metrics(symbol: str, start_ts: Any, end_ts: Any) -> pd.DataFra
     ]
 
     placeholders = ','.join(['%s'] * len(metrics))
+    # Select interval as well to filter later
     sql = f"""
-        SELECT ts, metric, val
+        SELECT ts, metric, val, interval
         FROM indicators.values
         WHERE symbol = %s
           AND metric IN ({placeholders})

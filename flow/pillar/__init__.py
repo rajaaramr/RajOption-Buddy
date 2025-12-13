@@ -1,0 +1,1 @@
+from flow.pillar.flow_pillar_optimized import process_symbol_vectorized
