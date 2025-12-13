@@ -491,16 +491,28 @@ def train_and_write_all_flow_models(
 
         # 7) Prepare rows for indicators.ml_pillars
         rows = []
+        seen_keys = set()
+
         for (ts, row), p_long, p_short in zip(df.iterrows(), prob_long, prob_short):
+            # Unique key for DB constraint: (symbol, market_type, pillar, tf, ts, target_name, version)
+            # We use this to deduplicate locally before insertion to prevent CardinalityViolation
+            key = (
+                row["symbol"],
+                target.market_type,
+                "flow",
+                row["tf"],
+                ts.to_pydatetime(),
+                target.name,
+                target.version
+            )
+
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
             rows.append(
                 (
-                    row["symbol"],
-                    target.market_type,   # 'futures'
-                    "flow",               # pillar
-                    row["tf"],
-                    ts.to_pydatetime(),
-                    target.name,          # target_name (full INI section)
-                    target.version,
+                    *key,
                     float(p_long),
                     float(p_short),
                     float(row["future_ret_pct"]),
