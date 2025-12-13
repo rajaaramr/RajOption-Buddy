@@ -124,6 +124,22 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+def sigmoid(x: float, center: float = 0.5, steepness: float = 12.0) -> float:
+    """
+    Sigmoid normalization function.
+    Maps input x (typically 0-1) to an S-curve.
+
+    Args:
+        x: Input value
+        center: The x-value where sigmoid is 0.5
+        steepness: Controls how sharp the transition is
+    """
+    try:
+        val = 1.0 / (1.0 + np.exp(-steepness * (x - center)))
+        return float(val)
+    except Exception:
+        return 0.5
+
 
 # ---------- DB loaders ----------
 def _load_rules_and_ml(
@@ -231,6 +247,10 @@ def _fuse_row(
     ml_prob_cal = _calibrate_prob(ml_prob_raw)
     ml_score = round(100.0 * ml_prob_cal, 2)
 
+    # Calculate ML Bucket (1: Bearish to 5: Bullish)
+    # 0-20, 20-40, 40-60, 60-80, 80-100
+    ml_bucket = min(5, max(1, int(ml_score / 20.0) + 1))
+
     base_prob = rules_score / 100.0
     w = cfg["blend_weight"]
     w = max(0.0, min(1.0, float(w)))
@@ -238,6 +258,11 @@ def _fuse_row(
     fused_prob = (1.0 - w) * base_prob + w * ml_prob_cal
     fused_prob = max(0.0, min(1.0, fused_prob))
     fused_score = round(100.0 * fused_prob, 2)
+
+    # Sigmoid Normalization for Final Score
+    # Centers the fused probability (0-1) around 0.5 with steepness
+    fused_prob_sigmoid = sigmoid(fused_prob, center=0.5, steepness=10.0)
+    score_final = round(100.0 * fused_prob_sigmoid, 2)
 
     fused_veto = rules_veto
 
@@ -258,8 +283,10 @@ def _fuse_row(
         "ml_prob_raw": ml_prob_raw,
         "ml_prob_cal": ml_prob_cal,
         "ml_score": ml_score,
+        "ml_bucket": ml_bucket,
         "fused_prob": fused_prob,
         "fused_score": fused_score,
+        "score_final": score_final,
         "fused_veto": fused_veto,
     }
 
@@ -340,6 +367,17 @@ def _run_backfill(
                     mt,
                     tf_row,
                     ts,
+                    "FLOW.ml_bucket",
+                    float(fused["ml_bucket"]),
+                    "{}",
+                    run_id,
+                    source,
+                ),
+                (
+                    sym,
+                    mt,
+                    tf_row,
+                    ts,
                     "FLOW.ml_p_up_cal",
                     float(fused["ml_prob_cal"]),
                     "{}",
@@ -364,6 +402,17 @@ def _run_backfill(
                     ts,
                     "FLOW.fused_score",
                     float(fused["fused_score"]),
+                    "{}",
+                    run_id,
+                    source,
+                ),
+                (
+                    sym,
+                    mt,
+                    tf_row,
+                    ts,
+                    "FLOW.score_final",
+                    float(fused["score_final"]),
                     "{}",
                     run_id,
                     source,

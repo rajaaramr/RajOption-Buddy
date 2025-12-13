@@ -16,6 +16,7 @@ from psycopg2.extras import execute_values
 
 from utils.db import get_db_connection
 from pillars.common import TZ
+from flow.pillar.flow_features_optimized import FlowFeatureEngine, load_daily_futures, load_external_metrics
 
 ML_TARGETS_INI = "ml_targets.ini"
 
@@ -274,6 +275,48 @@ def load_flow_features_and_returns(
 
     # we need valid forward return ONLY after applying guardrail
     df = df.dropna(subset=["future_ret_pct"])
+
+    # ------------------------------------------------------------------
+    # 3) Enrich with Advanced Flow Features (VOI, Daily, Session)
+    # ------------------------------------------------------------------
+    print(f"[FLOW_ML] Enriching with Advanced Flow Features for {len(df)} rows...")
+
+    # We need to process per-symbol because FlowFeatureEngine is symbol-aware (daily futures merge)
+    enriched_chunks = []
+
+    # Get unique symbols in the dataset
+    symbols = df["symbol"].unique()
+
+    for sym in symbols:
+        # Slice for this symbol
+        df_sym = df[df["symbol"] == sym].copy()
+        if df_sym.empty:
+            continue
+
+        # Load Daily Data for this symbol
+        daily_df = load_daily_futures(sym)
+
+        # Load External Metrics
+        start_ts = df_sym.index[0]
+        end_ts = df_sym.index[-1]
+        metrics_df = load_external_metrics(sym, start_ts, end_ts)
+        # Filter metrics for current TF if possible, though engine handles it
+        if not metrics_df.empty and "interval" in metrics_df.columns:
+             metrics_df = metrics_df[metrics_df['interval'] == base_tf]
+
+        # Initialize Engine
+        engine = FlowFeatureEngine(sym, "futures")
+
+        # Compute Features
+        # The engine expects a dataframe with OHLCV+OI. 'df_sym' has them from SQL.
+        # It returns the dataframe with NEW columns appended.
+        df_enriched = engine.compute_all_features(df_sym, daily_df, metrics_df)
+
+        enriched_chunks.append(df_enriched)
+
+    if enriched_chunks:
+        df = pd.concat(enriched_chunks)
+        df = df.sort_index()
 
     return df
 
