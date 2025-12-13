@@ -126,8 +126,7 @@ def write_values_direct(rows: List[tuple]) -> None:
             val = EXCLUDED.val,
             context = EXCLUDED.context,
             run_id = EXCLUDED.run_id,
-            source = EXCLUDED.source,
-            updated_at = NOW()
+            source = EXCLUDED.source
     """
 
     try:
