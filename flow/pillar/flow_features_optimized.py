@@ -185,6 +185,10 @@ class FlowFeatureEngine:
         Generates synthetic daily data (buildup, OI/Price change) from 15m candles
         if the real daily_futures data is missing.
         """
+        # If OI is missing (Spot), we cannot generate Buildup or OI change.
+        if 'oi' not in df_15m.columns:
+            return pd.DataFrame(columns=['trade_date', 'buildup', 'oi_change_pct', 'day_change_pct'])
+
         # Ensure UTC-localized index for resampling logic
         if df_15m.index.tz is None:
             df_work = df_15m.tz_localize('UTC')
