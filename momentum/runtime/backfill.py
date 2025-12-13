@@ -1,4 +1,3 @@
-# momentum/runtime/backfill.py
 from __future__ import annotations
 
 import argparse
@@ -35,17 +34,14 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument(
         "--from-date",
-        help="Override start date (YYYY-MM-DD). If set, ignores last_ts + lookback-days.",
+        help="Override start date (YYYY-MM-DD). If set, ignores stored last_ts.",
         default=None,
     )
     p.add_argument(
         "--lookback-days",
         type=int,
         default=None,
-        help=(
-            "If set, score last N days BACK from now (full history in that window). "
-            "Does NOT use mom_*_last_*_ts for resume – it rewrites that window."
-        ),
+        help="If set, score last N days BACK from now (full history in that window).",
     )
 
     p.add_argument(
@@ -74,7 +70,7 @@ def _load_universe(
 ) -> pd.DataFrame:
     """
     Load symbols + existing momentum status from reference.symbol_universe.
-    We keep mom_*_last_*_ts ONLY for writing back, not for resume.
+    Uses mom_rules_last_*, mom_ml_last_* columns.
     """
     if kind not in ("futures", "spot"):
         raise ValueError(f"Unknown kind={kind}")
@@ -110,7 +106,7 @@ def _load_universe(
 
 
 def _get_last_ts_for_kind(row: pd.Series, kind: str) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-    """Return (rules_ts, ml_ts) for given kind."""
+    """Return (rules_ts, ml_ts) for given kind from symbol_universe row."""
     if kind == "futures":
         rules_ts = row["mom_rules_last_fut_ts"]
         ml_ts = row["mom_ml_last_fut_ts"]
@@ -126,36 +122,42 @@ def _get_last_ts_for_kind(row: pd.Series, kind: str) -> Tuple[Optional[pd.Timest
 def _compute_from_ts(
     now: dt.datetime,
     mode: str,
+    rules_ts: Optional[pd.Timestamp],
+    ml_ts: Optional[pd.Timestamp],
     from_date_str: Optional[str],
     lookback_days: Optional[int],
 ) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
     """
-    IMPORTANT BEHAVIOUR:
+    Decide effective from_ts for rules and ML legs.
 
-    - If from-date is given:
-          from_ts = that date (start of day, UTC)
-    - Else if lookback-days is given:
-          from_ts = now - lookback_days (UTC, tz-aware)
+    - If from_date_str is given:
+          rules_from = ml_from = that date (for legs active in mode).
+    - Else if lookback_days is given:
+          base_from = now - lookback_days
+          rules_from = ml_from = base_from
     - Else:
-          from_ts = None → score FULL history available.
+          resume from stored last_ts (rules_ts / ml_ts).
     """
+    # Normalize "now" as tz-aware UTC Timestamp
+    now_ts = pd.Timestamp(now).tz_convert("UTC") if now.tzinfo else pd.Timestamp(now, tz="UTC")
+
     base_from: Optional[pd.Timestamp] = None
 
     if from_date_str:
-        # from_date_str is naive → localize to UTC
-        base_from = pd.Timestamp(from_date_str).tz_localize("UTC")
+        base_from = pd.Timestamp(from_date_str).replace(tzinfo=dt.timezone.utc)
     elif lookback_days is not None:
-        # now is already tz-aware (UTC), so just subtract days
-        dt_from = now - dt.timedelta(days=lookback_days)
-        base_from = pd.Timestamp(dt_from)  # keep tzinfo from dt_from
+        base_from = now_ts - pd.Timedelta(days=lookback_days)
 
     rules_from: Optional[pd.Timestamp] = None
     ml_from: Optional[pd.Timestamp] = None
 
+    # ---- Rules leg ----
     if mode in ("rules", "both"):
-        rules_from = base_from
+        rules_from = base_from if base_from is not None else rules_ts
+
+    # ---- ML leg ----
     if mode in ("ml", "both"):
-        ml_from = base_from
+        ml_from = base_from if base_from is not None else ml_ts
 
     return rules_from, ml_from
 
@@ -174,7 +176,7 @@ def _load_15m_candles(
       - market.futures_candles
       - market.spot_candles
 
-    No tf column – table itself is 15m.
+    Tables have NO tf column – they are already 15m.
     """
     if kind == "futures":
         table = "market.futures_candles"
@@ -182,8 +184,10 @@ def _load_15m_candles(
         table = "market.spot_candles"
 
     if from_ts is not None:
+        # Warm up from_ts by a few days for indicators
         candle_from = (from_ts - dt.timedelta(days=WARMUP_DAYS)).to_pydatetime()
     else:
+        # default: 1 year + warmup
         candle_from = (now - dt.timedelta(days=WARMUP_DAYS + 365)).replace(tzinfo=None)
 
     sql = f"""
@@ -219,20 +223,21 @@ def _process_symbol(
 ) -> Dict[str, Optional[pd.Timestamp]]:
     """
     For a single symbol:
-      - Decide from_ts window based on lookback / from-date.
+      - Decide from_ts window based on from-date / lookback / resume.
       - Load 15m candles for that window + warmup.
-      - For each TF (15m/30m/60m/120m), and for each bar in the window,
-        call score_momentum() so we get FULL HISTORY in that window.
+      - For each TF (15m/30m/60m/120m/240m),
+        call score_momentum() and let pillar handle resampling/indicators.
     """
     symbol = row["symbol"]
 
-    # Existing last_ts (only for status write-back)
     rules_last_ts_old, ml_last_ts_old = _get_last_ts_for_kind(row, kind)
 
-    # Compute from_ts purely from CLI args (no resume).
+    # Compute from_ts with resume semantics
     rules_from, ml_from = _compute_from_ts(
         now=now,
         mode=mode,
+        rules_ts=rules_last_ts_old,
+        ml_ts=ml_last_ts_old,
         from_date_str=args.from_date,
         lookback_days=args.lookback_days,
     )
@@ -253,7 +258,6 @@ def _process_symbol(
         print(f"[MOM] {symbol} {kind}: no 15m candles or too few rows, skipping.")
         return {"rules_last_ts": rules_last_ts_old, "ml_last_ts": ml_last_ts_old}
 
-    # If no from_ts given, use full history window from candles
     if effective_from is None:
         effective_from = df15.index[0]
 
@@ -272,7 +276,7 @@ def _process_symbol(
 
     # Loop timeframes
     for tf in TF_LIST:
-        # Build TF index (just to know which timestamps to score)
+        # Build TF index from 15m base
         if tf == BASE_TF:
             tf_frame = df15
         else:
@@ -296,7 +300,7 @@ def _process_symbol(
                     symbol=symbol,
                     kind=kind,
                     tf=tf,
-                    df5=df_slice,        # 15m base frame
+                    df5=df_slice,       # 15m base frame; pillar does its own resample/normalize
                     base=base,
                     ini_path=ini_path,
                     mode=mode,
@@ -309,6 +313,7 @@ def _process_symbol(
                 continue
 
             ts_scored, fused_score, fused_veto = res
+            # score_momentum already logs rules vs fused; keep this minimal
             print(
                 f"[MOM] {symbol} {kind} {tf} @ {ts_scored}: "
                 f"fused={fused_score:.2f}, veto={fused_veto}"
@@ -325,41 +330,6 @@ def _process_symbol(
 
     return {"rules_last_ts": new_rules_last_ts, "ml_last_ts": new_ml_last_ts}
 
-from utils.db import get_db_connection  # already imported at top
-
-def _sync_rules_status_from_metrics(kind: str):
-    """
-    Sync mom_rules_last_*_ts in reference.symbol_universe
-    from indicators.metric_values (MOM.score).
-    Run after a rules backfill.
-    """
-    if kind not in ("futures", "spot"):
-        return
-
-    col = "mom_rules_last_fut_ts" if kind == "futures" else "mom_rules_last_spot_ts"
-
-    sql = f"""
-        UPDATE reference.symbol_universe su
-        SET
-            {col} = mv.max_ts,
-            mom_rules_last_run_at = NOW()
-        FROM (
-            SELECT
-                symbol,
-                MAX(ts) AS max_ts
-            FROM indicators.metric_values
-            WHERE
-                kind = %s
-                AND name = 'MOM.score'
-            GROUP BY symbol
-        ) mv
-        WHERE
-            su.symbol = mv.symbol
-            AND su.enabled = TRUE;
-    """
-    with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute(sql, (kind,))
-        conn.commit()
 
 # ---------------------------------
 # Status writer
@@ -466,12 +436,8 @@ def main():
         run_finished_at=run_finished_at,
     )
 
-     # 🔁 Extra safety: sync from metric_values for rules runs
-    if args.mode in ("rules", "both"):
-        print(f"[MOM] Syncing mom_rules_last_*_ts from indicators.metric_values for kind={args.kind}...")
-        _sync_rules_status_from_metrics(args.kind)
-
     print("[MOM] Backfill complete.")
+
 
 if __name__ == "__main__":
     main()
