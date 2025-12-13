@@ -180,11 +180,92 @@ class FlowFeatureEngine:
 
         return df
 
+    def _generate_synthetic_daily(self, df_15m: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generates synthetic daily data (buildup, OI/Price change) from 15m candles
+        if the real daily_futures data is missing.
+        """
+        # Ensure UTC-localized index for resampling logic
+        if df_15m.index.tz is None:
+            df_work = df_15m.tz_localize('UTC')
+        else:
+            df_work = df_15m.copy()
+
+        # Convert to IST for correct "Day" boundaries
+        df_ist = df_work.tz_convert('Asia/Kolkata')
+
+        # Resample to Daily (1D) based on IST days
+        # Close = last close, OI = last OI, Volume = sum
+        daily = df_ist.resample('1D').agg({
+            'close': 'last',
+            'oi': 'last',
+            'volume': 'sum'
+        }).dropna(subset=['close'])
+
+        # Shift to get previous day values
+        prev = daily.shift(1)
+
+        # Calculate Percentage Changes
+        # Avoid division by zero
+        price_chg_pct = (daily['close'] - prev['close']) / prev['close'].replace(0, np.nan) * 100.0
+        oi_chg_pct = (daily['oi'] - prev['oi']) / prev['oi'].replace(0, np.nan) * 100.0
+
+        # Infer Buildup String
+        # Price > Prev AND OI > Prev -> Long Build Up
+        # Price > Prev AND OI < Prev -> Short Covering
+        # Price < Prev AND OI > Prev -> Short Build Up
+        # Price < Prev AND OI < Prev -> Long Unwind
+
+        conditions = [
+            (price_chg_pct > 0) & (oi_chg_pct > 0),
+            (price_chg_pct > 0) & (oi_chg_pct < 0),
+            (price_chg_pct < 0) & (oi_chg_pct > 0),
+            (price_chg_pct < 0) & (oi_chg_pct < 0)
+        ]
+        choices = ["Long Build Up", "Short Covering", "Short Build Up", "Long Unwind"]
+
+        daily['buildup'] = np.select(conditions, choices, default="Neutral")
+        daily['oi_change_pct'] = oi_chg_pct.fillna(0.0)
+        daily['day_change_pct'] = price_chg_pct.fillna(0.0)
+        daily['trade_date'] = daily.index.date
+
+        # Return dataframe matching daily_df schema subset
+        return daily[['trade_date', 'buildup', 'oi_change_pct', 'day_change_pct']]
+
     def _merge_daily_futures(self, df: pd.DataFrame, daily_df: pd.DataFrame) -> pd.DataFrame:
         """
         Merges daily futures data (buildup, oi_change, etc.) onto 15m bars.
-        Joins on Date.
+        Joins on Date. Fills gaps with synthetic data if needed.
         """
+        # Generate synthetic daily coverage from the 15m data itself
+        synthetic_daily = self._generate_synthetic_daily(df)
+
+        # Combine Real and Synthetic
+        # We prioritize 'daily_df' (Real) where it exists.
+        # merge: Real left join Synthetic? No, we want full coverage.
+        # Concat and dedupe keeping real?
+
+        # Prepare real DF
+        real_subset = daily_df[['trade_date', 'buildup', 'oi_change_pct', 'day_change_pct']].copy()
+        real_subset['trade_date'] = pd.to_datetime(real_subset['trade_date']).dt.date
+        real_subset['source'] = 'real'
+
+        synthetic_daily['source'] = 'synthetic'
+
+        # Concatenate and keep 'real' if duplicates exist on trade_date
+        combined = pd.concat([real_subset, synthetic_daily], ignore_index=True)
+        # Drop duplicates on date, keeping first (which should be 'real' if we sort)
+        # But concat order matters.
+        # Actually, let's merge.
+
+        # Re-index by date for easier combining
+        real_indexed = real_subset.set_index('trade_date')
+        syn_indexed = synthetic_daily.set_index('trade_date')
+
+        # Combine: Real.combine_first(Synthetic) -> Fills Real NaNs with Synthetic values
+        # This aligns indices (dates) and fills gaps.
+        final_daily = real_indexed.combine_first(syn_indexed).reset_index()
+
         # Prepare 15m date column for join
         if df.index.tz is None:
             ts_local = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
@@ -193,22 +274,10 @@ class FlowFeatureEngine:
 
         df['join_date'] = ts_local.date
 
-        # Prepare daily df
-        # daily_df should have 'trade_date' as datetime.date or similar
-        # Ensure daily_df columns are ready
-        cols_to_use = ['trade_date', 'buildup', 'oi_change_pct', 'day_change_pct', 'volume_shares_chg_pct']
-        # Map to what INI expects:
-        # daily_fut_buildup -> buildup
-        # daily_opt_call_oi_chg_pct -> (Wait, daily_futures table doesn't have options data, but INI asks for it)
-        # Note: The User prompt only mentioned daily_futures for 'buildup'.
-        # Options data (Call OI) might be in a different table, but for now we map what we have.
-
-        daily_subset = daily_df[cols_to_use].copy()
-        daily_subset['trade_date'] = pd.to_datetime(daily_subset['trade_date']).dt.date
-
-        daily_subset = daily_subset.rename(columns={
+        # Use final_daily (Combined Real + Synthetic)
+        daily_use = final_daily.rename(columns={
             'buildup': 'daily_fut_buildup',
-            'oi_change_pct': 'daily_fut_oi_chg_pct', # Disambiguate
+            'oi_change_pct': 'daily_fut_oi_chg_pct',
             'day_change_pct': 'daily_fut_price_chg_pct'
         })
 
@@ -220,7 +289,7 @@ class FlowFeatureEngine:
              # Fallback if it was unnamed and became 'index'
              df_reset = df_reset.rename(columns={'index': idx_name})
 
-        merged = df_reset.merge(daily_subset, left_on='join_date', right_on='trade_date', how='left')
+        merged = df_reset.merge(daily_use, left_on='join_date', right_on='trade_date', how='left')
         merged = merged.set_index(idx_name) # Restore index
 
         # Cleanup
@@ -228,6 +297,8 @@ class FlowFeatureEngine:
             del merged['join_date']
         if 'trade_date' in merged.columns:
             del merged['trade_date']
+        if 'source' in merged.columns:
+            del merged['source']
 
         return merged
 
