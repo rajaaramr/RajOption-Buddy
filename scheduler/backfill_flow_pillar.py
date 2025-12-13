@@ -1,278 +1,312 @@
-# scheduler/backfill_flow_pillar.py
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone, time
-from typing import List, Tuple, Optional
+from datetime import datetime
+from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 
-from flow.pillar.flow_pillar import score_flow
-from flow.runtime.utils import (
-    get_flow_last_ts,
-    update_flow_status,
-    update_flow_ml_backfill_status,
-)
 from utils.db import get_db_connection
-from pillars.common import (
-    TZ,
-    BaseCfg,
-    resample,
-    ensure_min_bars,
-    maybe_trim_last_bar,
-)
+from pillars.common import TZ, BaseCfg, write_values, resample, maybe_trim_last_bar
 
-# ---------------------------------------------------------------------
-# Load base 15m candles
-# ---------------------------------------------------------------------
-def load_base_15m(symbol: str, kind: str, lookback_days: int) -> pd.DataFrame:
-    """
-    Load 15m OHLCV(+OI) from Postgres for a single symbol.
+from flow.pillar.flow_pillar import score_flow
 
-    kind:
-      - "futures" -> market.futures_candles
-      - "spot"    -> market.spot_candles
 
-    Assumes these tables store 15m candles.
-    """
-    cutoff = datetime.now(TZ) - timedelta(days=lookback_days)
+UNIVERSE_TABLE = "reference.symbol_universe"
 
-    if kind == "futures":
-        table = "market.futures_candles"
-        cols = "ts, open, high, low, close, volume, oi"
-    else:
-        table = "market.spot_candles"
-        cols = "ts, open, high, low, close, volume, 0::bigint AS oi"
 
+# ============================================================
+# Universe helpers (YOUR schema)
+# ============================================================
+
+def get_symbols(extra_where: str = "enabled = TRUE", limit: int = 0) -> List[str]:
     sql = f"""
-        SELECT {cols}
-          FROM {table}
-         WHERE symbol = %s
-           AND ts >= %s
-           AND EXTRACT(ISODOW FROM ts) BETWEEN 1 AND 5   -- Mon–Fri only
-           AND ts::time >= TIME '09:15:00'               -- after market open
-           AND ts::time <= TIME '15:30:00'               -- before close
-         ORDER BY ts
+        SELECT symbol
+        FROM {UNIVERSE_TABLE}
+        WHERE {extra_where}
+        ORDER BY 1
     """
+    if limit and limit > 0:
+        sql += f" LIMIT {int(limit)}"
 
-    with get_db_connection() as conn:
-        df = pd.read_sql(sql, conn, params=(symbol, cutoff))
-
-    if df.empty:
-        raise RuntimeError(f"No 15m data for {symbol} kind={kind} after cutoff={cutoff}")
-
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    df = df.set_index("ts").sort_index()
-
-    # Extra safety: filter in Python with IST-aware checks
-    ts_ist = df.index.tz_convert("Asia/Kolkata")
-
-    # 1. Monday–Friday
-    mask_weekday = ts_ist.dayofweek < 5  # 0=Mon, 4=Fri
-
-    # 2. Time filter 09:15–15:30 IST
-    t_open = time(9, 15)
-    t_close = time(15, 30)
-    mask_time = (ts_ist.time >= t_open) & (ts_ist.time <= t_close)
-
-    df = df.loc[mask_weekday & mask_time]
-
-    # numeric cleanup
-    for col in ["open", "high", "low", "close", "volume", "oi"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
-    return df
-
-
-# ---------------------------------------------------------------------
-# Min bars helper
-# ---------------------------------------------------------------------
-def min_bars_for_tf_rules(tf: str) -> int:
-    """
-    Return minimum bars required for rules-based flow scoring for a given TF.
-    """
-    min_bars_map = {
-        "15m": 5,
-        "30m": 3,
-        "60m": 2,
-        "120m": 2,
-        "240m": 2,
-    }
-    return min_bars_map.get(tf, 5)
-
-
-# ---------------------------------------------------------------------
-# TF selection helper
-# ---------------------------------------------------------------------
-def get_flow_tfs(args_tf: Optional[str]) -> List[str]:
-    """
-    Decide which TFs to backfill.
-
-    For now:
-      - if --tf provided -> use only that
-      - else -> default: 15m,30m,60m,120m,240m
-    """
-    if args_tf:
-        return [args_tf]
-
-    return ["15m", "30m", "60m", "120m", "240m"]
-
-
-# ---------------------------------------------------------------------
-# Universe loader
-# ---------------------------------------------------------------------
-def load_universe_symbols() -> List[str]:
-    """
-    Load universe of symbols from reference.symbol_universe.
-    Only enabled symbols.
-    """
-    sql = """
-        SELECT DISTINCT symbol
-          FROM reference.symbol_universe
-         WHERE enabled = TRUE
-         ORDER BY symbol
-    """
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(sql)
-        rows = cur.fetchall()
-
-    return [r[0] for r in rows] if rows else []
+        return [r[0] for r in cur.fetchall()]
 
 
-# ---------------------------------------------------------------------
-# from_ts helper for delta logic
-# ---------------------------------------------------------------------
-def compute_from_ts(
-    now_utc: datetime,
-    lookback_days: int,
-    last_ts_status: Optional[datetime],
-    from_date_str: Optional[str],
-) -> datetime:
+def is_symbol_enabled(symbol: str) -> bool:
+    sql = f"SELECT enabled FROM {UNIVERSE_TABLE} WHERE symbol=%s"
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (symbol,))
+        r = cur.fetchone()
+        return bool(r and r[0])
+
+
+def _resume_col(kind: str, mode: str) -> str:
     """
-    Decide from_ts for delta backfill.
-
-    Priority:
-      1) If --from-date provided → use that (IST 00:00 converted to UTC),
-         but never later than now_utc.
-      2) Else if last_ts_status → max(last_ts_status, now_utc - lookback_days)
-      3) Else → now_utc - lookback_days
+    Which column holds the resume pointer.
+    rules: flow_rules_last_{fut|spot}_ts
+    ml:    flow_ml_last_{fut|spot}_ts
+    fused: resume from rules pointer (safe)
     """
-    lb_default = now_utc - timedelta(days=lookback_days)
-
-    if from_date_str:
-        dt = datetime.fromisoformat(from_date_str.strip())  # naive local date
-        dt_ist = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        dt_utc = dt_ist - timedelta(hours=5, minutes=30)
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        return min(now_utc, dt_utc)
-
-    if last_ts_status is not None:
-        if last_ts_status.tzinfo is None:
-            last_ts_status = last_ts_status.replace(tzinfo=timezone.utc)
-        return max(last_ts_status, lb_default)
-
-    return lb_default
+    if mode == "ml":
+        return "flow_ml_last_fut_ts" if kind == "futures" else "flow_ml_last_spot_ts"
+    # rules or fused
+    return "flow_rules_last_fut_ts" if kind == "futures" else "flow_rules_last_spot_ts"
 
 
-# ---------------------------------------------------------------------
-# Core backfill logic for ONE symbol (all TFs)
-# ---------------------------------------------------------------------
-def backfill_flow_for_symbol(
+def _audit_cols(mode: str) -> tuple[str, str]:
+    """
+    Which audit columns to update for run_at/run_id.
+    """
+    if mode == "ml":
+        return ("flow_ml_last_run_at", "flow_ml_last_run_id")
+    return ("flow_rules_last_run_at", "flow_rules_last_run_id")
+
+
+def get_resume_ts(symbol: str, kind: str, mode: str) -> Optional[datetime]:
+    col = _resume_col(kind, mode)
+    sql = f"SELECT {col} FROM {UNIVERSE_TABLE} WHERE symbol=%s"
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (symbol,))
+        r = cur.fetchone()
+        return r[0] if r and r[0] else None
+
+
+def get_target_until_ts(symbol: str, kind: str) -> Optional[datetime]:
+    col = "fut_15m_target_until_ts" if kind == "futures" else "spot_15m_target_until_ts"
+    sql = f"SELECT {col} FROM {UNIVERSE_TABLE} WHERE symbol=%s"
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (symbol,))
+        r = cur.fetchone()
+        return r[0] if r and r[0] else None
+
+
+def update_flow_run_audit(symbol: str, run_id: str, mode: str) -> None:
+    col_at, col_run = _audit_cols(mode)
+    sql = f"""
+        UPDATE {UNIVERSE_TABLE}
+           SET {col_at} = NOW(),
+               {col_run} = %s
+         WHERE symbol = %s
+    """
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (run_id, symbol))
+        conn.commit()
+
+
+def update_flow_last_ts(symbol: str, kind: str, mode: str, last_ts: datetime) -> None:
+    col = _resume_col(kind, mode)
+    sql = f"UPDATE {UNIVERSE_TABLE} SET {col}=%s WHERE symbol=%s"
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (last_ts, symbol))
+        conn.commit()
+
+
+def set_flow_error(symbol: str, kind: str, msg: str) -> None:
+    col = "fut_last_error" if kind == "futures" else "spot_last_error"
+    sql = f"UPDATE {UNIVERSE_TABLE} SET {col}=%s WHERE symbol=%s"
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(sql, (msg[:500], symbol))
+        conn.commit()
+
+
+# ============================================================
+# Candle loader (adjust here ONLY if table names differ)
+# ============================================================
+
+def load_15m(symbol: str, kind: str) -> pd.DataFrame:
+    if kind == "futures":
+        candidates = [
+            ("market.futures_candles", True),      # has interval col
+            ("public.futures_ohlcv_15m", False),
+            ("market.futures_ohlcv_15m", False),
+        ]
+    else:
+        candidates = [
+            ("market.spot_candles", True),
+            ("public.spot_ohlcv_15m", False),
+            ("market.spot_ohlcv_15m", False),
+        ]
+
+    with get_db_connection() as conn:
+        for table, has_interval in candidates:
+            try:
+                interval_clause = "AND interval='15m'" if has_interval else ""
+                sql = f"""
+                    SELECT ts, open, high, low, close, volume
+                           {", oi" if kind=="futures" else ""}
+                    FROM {table}
+                    WHERE symbol=%s
+                    {interval_clause}
+                    ORDER BY ts
+                """
+                df = pd.read_sql(sql, conn, params=(symbol,))
+                if df is None or df.empty:
+                    continue
+
+                df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+                df = df.dropna(subset=["ts"]).set_index("ts").sort_index()
+
+                for c in ["open", "high", "low", "close", "volume"]:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                if "oi" in df.columns:
+                    df["oi"] = pd.to_numeric(df["oi"], errors="coerce")
+
+                return df
+            except Exception:
+                continue
+
+    raise RuntimeError(
+        f"[LOAD] No candle source worked for {symbol} kind={kind}. Update load_15m() candidates."
+    )
+
+
+# ============================================================
+# Utils
+# ============================================================
+
+def parse_dt(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    s = s.replace(" ", "T")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt
+
+
+def _to_dt_ist(ts: pd.Timestamp) -> datetime:
+    return ts.to_pydatetime().replace(tzinfo=TZ)
+
+def dedupe_rows(rows):
+    seen = set()
+    out = []
+    for r in rows:
+        key = (r[0], r[1], r[2], r[3], r[4])  # symbol, kind, tf, ts, metric
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+# ============================================================
+# Backfill core
+# ============================================================
+
+
+def backfill_symbol(
     symbol: str,
     kind: str,
+    mode: str,
     tfs: List[str],
     lookback_days: int,
-    max_bars: int,
-    flow_ini_path: str,
+    ini_path: str,
     run_id: str,
-    source: str,
-    mode: str,
     from_ts: Optional[datetime],
-) -> Tuple[Optional[datetime], Optional[datetime]]:
-    """
-    For a given symbol+kind, backfill FLOW for the given TFs.
+    max_bars: int,
+    flush_every: int,
+    use_target_until: bool,
+    resume: bool,
+) -> None:
+    symbol = symbol.strip().upper()
 
-    - Loads 15m candles once.
-    - For each TF:
-        * Resample 15m → TF.
-        * Build candidate TS list (respecting from_ts + max_bars).
-        * For each TS: slice DF up to TS and call score_flow(...).
+    if not is_symbol_enabled(symbol):
+        print(f"[SKIP] {symbol} disabled")
+        return
 
-    Returns:
-        (rules_last_ts, ml_last_ts) based on what score_flow() actually produced.
-    """
-    mode = (mode or "rules").lower()
-    print(
-        f"[FLOW_BACKFILL] symbol={symbol} kind={kind} "
-        f"tfs={tfs} lookback_days={lookback_days} max_bars={max_bars} mode={mode} from_ts={from_ts}"
-    )
+    update_flow_run_audit(symbol, run_id, mode)
 
-    # 1) Load base 15m history once
-    try:
-        df15 = load_base_15m(symbol, kind, lookback_days)
-    except Exception as e:
-        print(f"[FLOW_BACKFILL] {symbol} {kind}: ERROR loading 15m data -> {e}")
-        return (None, None)
+    df15 = load_15m(symbol, kind)
+    if df15 is None or df15.empty:
+        print(f"[SKIP] {symbol} {kind}: no 15m data")
+        return
 
-    if df15.empty:
-        print(f"[FLOW_BACKFILL] {symbol} {kind}: no 15m data after load, skipping")
-        return (None, None)
+    df15 = maybe_trim_last_bar(df15)
+    if len(df15) < 5:
+        print(f"[SKIP] {symbol} {kind}: too few bars")
+        return
 
-    base = BaseCfg(
-        tfs=tfs,
-        lookback_days=lookback_days,
-        run_id=run_id,
-        source=source,
-    )
+    base = BaseCfg(tfs=tfs, lookback_days=lookback_days, run_id=run_id, source="FLOW_BACKFILL")
 
-    total_scored = 0
-    rules_last_ts: Optional[datetime] = None
-    ml_last_ts: Optional[datetime] = None
+    # Optional stop boundary
+    target_until = get_target_until_ts(symbol, kind) if use_target_until else None
+    target_until_utc = None
+    if target_until:
+        try:
+            target_until_utc = pd.Timestamp(target_until).tz_convert("UTC")
+        except Exception:
+            target_until_utc = pd.Timestamp(target_until).tz_localize("Asia/Kolkata").tz_convert("UTC")
+
+    idx15 = df15.index.values  # numpy datetime64[ns, UTC]
+
+    # mode -> force_ml
+    force_ml = None
+    if mode == "rules":
+        force_ml = False
+    elif mode in ("ml", "fused"):
+        force_ml = True
+
+    # ✅ Freeze resume pointer ONCE per symbol run
+    resume_ts0: Optional[datetime] = None
+    if resume:
+        resume_ts0 = get_resume_ts(symbol, kind, mode)
+
+    eff_from0 = resume_ts0
+    if from_ts and (eff_from0 is None or from_ts > eff_from0):
+        eff_from0 = from_ts
+
+    # Convert eff_from0 to UTC once (fast filtering)
+    eff_from0_utc = None
+    if eff_from0:
+        try:
+            eff_from0_utc = pd.Timestamp(eff_from0).tz_convert("UTC")
+        except Exception:
+            eff_from0_utc = pd.Timestamp(eff_from0).tz_localize("Asia/Kolkata").tz_convert("UTC")
+
+    # ✅ Final pointer must track ONLY 15m progress
+    final_last_ts_15m: Optional[datetime] = None
 
     for tf in tfs:
-        # --- Build TF-level series to get timestamps we want to score ---
-        if tf == "15m":
-            dftf = df15.copy()
-        else:
-            dftf = resample(df15, tf)
+        if not is_symbol_enabled(symbol):
+            print(f"[PAUSE] {symbol} disabled mid-run. stopping.")
+            return
 
-        dftf = maybe_trim_last_bar(dftf)
-
-        # ---- use *rules* min-bars, not ML min-bars ----
-        n = len(dftf)
-        rules_min = min_bars_for_tf_rules(tf)
-        if n < rules_min:
-            print(
-                f"[FLOW_BACKFILL] {symbol} {kind} tf={tf}: "
-                f"only {n} bars, need {rules_min} for rules → skipping TF"
-            )
+        dftf = df15 if tf == "15m" else maybe_trim_last_bar(resample(df15, tf))
+        if dftf is None or dftf.empty:
             continue
 
-        # Candidate TF timestamps in ascending order
-        ts_list = list(dftf.index)
-
-        # Apply from_ts filter for delta runs
-        if from_ts is not None:
-            ts_list = [ts for ts in ts_list if ts >= from_ts]
-
-        if not ts_list:
-            print(f"[FLOW_BACKFILL] {symbol} {kind} tf={tf}: no TF bars after from_ts={from_ts}, skipping")
-            continue
-
-        # Apply max_bars cap from the end
-        if max_bars is not None and max_bars > 0:
-            ts_list = ts_list[-max_bars:]
-
-        print(f"[FLOW_BACKFILL] {symbol} {kind} tf={tf}: {len(ts_list)} TF bars to score")
-
-        scored_tf = 0
-
-        for ts in ts_list:
-            df_slice = df15.loc[:ts]
-            if df_slice.empty:
+        if target_until_utc is not None:
+            dftf = dftf.loc[:target_until_utc]
+            if dftf.empty:
                 continue
+
+        ts_tf = dftf.index
+        if eff_from0_utc is not None:
+            ts_tf = ts_tf[ts_tf > eff_from0_utc]
+
+        if len(ts_tf) == 0:
+            print(f"[UPTODATE] {symbol} {kind} tf={tf}")
+            continue
+
+        if max_bars and max_bars > 0:
+            ts_tf = ts_tf[-max_bars:]
+
+        end_pos = np.searchsorted(idx15, ts_tf.values, side="right")
+
+        batch_rows = []
+        last_written_dt: Optional[datetime] = None
+        scored = 0
+
+        for i, pos in enumerate(end_pos):
+            if (i % 200) == 0 and (not is_symbol_enabled(symbol)):
+                print(f"[PAUSE] {symbol} disabled. stopping tf={tf}")
+                return
+
+            if pos <= 0:
+                continue
+
+            df_slice = df15.iloc[:pos]
 
             try:
                 res = score_flow(
@@ -281,243 +315,118 @@ def backfill_flow_for_symbol(
                     tf=tf,
                     df5=df_slice,
                     base=base,
-                    ini_path=flow_ini_path,
+                    ini_path=ini_path,
                     context=None,
+                    force_ml=force_ml,
+                    write_to_db=False,
                 )
-            except Exception as e:
-                print(f"[FLOW_BACKFILL] ERROR symbol={symbol} kind={kind} tf={tf} ts={ts}: {e}")
-                continue
-
-            if res is None:
-                # not enough bars / calc skipped upstream
-                continue
-
-            # -------------------------------------------------
-            # Tolerant to different score_flow() signatures
-            # -------------------------------------------------
-            if isinstance(res, tuple):
-                if len(res) == 4:
-                    ts_scored, fused_score, fused_veto, extras = res
-                    rules_score = extras.get("rules_score")
-                    ml_score = extras.get("ml_score")
-                elif len(res) == 6:
-                    ts_scored, rules_score, rules_veto, ml_score, fused_score, fused_veto = res
-                    extras = {}
-                elif len(res) == 7:
-                    ts_scored, rules_score, rules_veto, ml_score, fused_score, fused_veto, extras = res
-                else:
-                    print(
-                        f"[FLOW_BACKFILL] Unexpected score_flow() return len={len(res)} "
-                        f"for {symbol} {kind} tf={tf} ts={ts}"
-                    )
-                    continue
-            else:
-                print(
-                    f"[FLOW_BACKFILL] Unexpected score_flow() return type={type(res)} "
-                    f"for {symbol} {kind} tf={tf} ts={ts}"
-                )
-                continue
-
-            # -------------------------
-            # Track last rules / ML ts
-            # -------------------------
-            if rules_score is not None:
-                rules_last_ts = ts_scored if rules_last_ts is None else max(rules_last_ts, ts_scored)
-
-            if ml_score is not None:
-                ml_last_ts = ts_scored if ml_last_ts is None else max(ml_last_ts, ts_scored)
-
-            scored_tf += 1
-
-        print(f"[FLOW_BACKFILL] {symbol} {kind} tf={tf}: scored {scored_tf} bars")
-        total_scored += scored_tf
-
-    print(
-        f"[FLOW_BACKFILL] DONE {symbol} {kind}: "
-        f"total scored bars across TFs = {total_scored}"
-    )
-
-    # Respect mode for what we *report* upwards:
-    if mode == "rules":
-        return (rules_last_ts, None)
-    elif mode == "ml":
-        return (None, ml_last_ts)
-    else:  # "both"
-        return (rules_last_ts, ml_last_ts)
-
-
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser()
-
-    # --- symbol selection ---
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--symbol",
-        help="Single root symbol (e.g. ICICIBANK, INDIGO, etc.)",
-    )
-    group.add_argument(
-        "--all-symbols",
-        action="store_true",
-        help="Run for all symbols from reference.symbol_universe",
-    )
-
-    # --- core options ---
-    parser.add_argument("--kind", default="futures", choices=["futures", "spot"])
-    parser.add_argument(
-        "--tf",
-        default=None,
-        help="Single TF (e.g. 15m,30m,60m,120m,240m). If omitted, runs all.",
-    )
-    parser.add_argument("--lookback-days", type=int, default=40)
-    parser.add_argument("--max-bars", type=int, default=20)
-
-    # --- mode + from-date ---
-    parser.add_argument(
-        "--mode",
-        choices=["rules", "ml", "both"],
-        default="rules",
-        help="What to compute: rules-only, ml-only, or both",
-    )
-    parser.add_argument(
-        "--from-date",
-        help="Optional manual from-date (YYYY-MM-DD). If given, overrides status-based from_ts.",
-    )
-
-    # --- config + run-id ---
-    parser.add_argument(
-        "--flow-ini",
-        default="flow_scenarios.ini",
-        help="Path to flow_scenarios.ini (rules & [flow_ml])",
-    )
-    parser.add_argument(
-        "--run-id",
-        default="FLOW_BACKFILL",
-        help="run_id to stamp in indicators.values",
-    )
-    parser.add_argument(
-        "--source",
-        default="flow_backfill",
-        help="source to stamp in indicators.values",
-    )
-
-    parser.add_argument(
-        "--use-expiry-selector",
-        action="store_true",
-        help="(placeholder) Reserved for futures expiry selection; currently ignored.",
-    )
-
-    args = parser.parse_args()
-
-    # -------------------------
-    # 1) Resolve TFs + symbols
-    # -------------------------
-    tfs = get_flow_tfs(args.tf)
-
-    if args.symbol:
-        symbols = [args.symbol]
-    else:
-        symbols = load_universe_symbols()
-        if not symbols:
-            print("[FLOW_BACKFILL] No symbols found in reference.symbol_universe")
-            return
-        print(f"[FLOW_BACKFILL] Loaded {len(symbols)} symbols from reference.symbol_universe")
-
-    if args.use_expiry_selector and args.kind == "futures":
-        print(
-            "[FLOW_BACKFILL] WARNING: --use-expiry-selector requested, "
-            "but expiry selection is not yet wired to your metadata schema. "
-            "Using symbol as-is for futures backfill."
-        )
-
-    # -------------------------
-    # 2) Mode / timing context
-    # -------------------------
-    now_utc = datetime.now(timezone.utc)
-    kind = args.kind.lower()
-    mode = args.mode.lower()
-    lookback_days = args.lookback_days
-    run_id = args.run_id
-    source = args.source
-
-    # -------------------------
-    # 3) Per-symbol delta logic
-    # -------------------------
-    with get_db_connection() as conn:
-        for symbol in symbols:
-            print(f"[FLOW_BACKFILL] symbol={symbol} kind={kind} mode={mode}")
-
-            # ---- 3a) Read last status timestamps from symbol_universe ----
-            last_rules_ts, last_ml_ts = get_flow_last_ts(conn, symbol, kind, mode="both")
-
-            if mode == "rules":
-                last_ts_status = last_rules_ts
-            elif mode == "ml":
-                last_ts_status = last_ml_ts
-            else:  # "both"
-                if last_rules_ts and last_ml_ts:
-                    last_ts_status = min(last_rules_ts, last_ml_ts)
-                else:
-                    last_ts_status = last_rules_ts or last_ml_ts
-
-            # ---- 3b) Decide from_ts using helper ----
-            from_ts = compute_from_ts(
-                now_utc=now_utc,
-                lookback_days=lookback_days,
-                last_ts_status=last_ts_status,
-                from_date_str=args.from_date,
-            )
-
-            # -----------------------------
-            # 4) Delegate work for symbol
-            # -----------------------------
-            rules_last_scored_ts, ml_last_scored_ts = backfill_flow_for_symbol(
-                symbol=symbol,
-                kind=kind,
-                tfs=tfs,
-                lookback_days=lookback_days,
-                max_bars=args.max_bars,
-                flow_ini_path=args.flow_ini,
-                run_id=run_id,
-                source=source,
-                mode=mode,
-                from_ts=from_ts,
-            )
-
-            # -----------------------------
-            # 5) Map timestamps → futures/spot RULES columns
-            # -----------------------------
-            rules_ts_fut: Optional[datetime] = None
-            rules_ts_spot: Optional[datetime] = None
-
-            if mode in ("rules", "both") and rules_last_scored_ts is not None:
-                if kind == "futures":
-                    rules_ts_fut = rules_last_scored_ts
-                else:
-                    rules_ts_spot = rules_last_scored_ts
-
-            # ---- 5a) Update RULES status (only rules_* columns) ----
-            if mode in ("rules", "both") and (rules_ts_fut or rules_ts_spot):
-                update_flow_status(
-                    conn,
-                    symbol=symbol,
-                    run_id=run_id,
-                    rules_ts_fut=rules_ts_fut,
-                    rules_ts_spot=rules_ts_spot,
-                    mode="rules",   # 🔒 rules-only
-                )
-
-            # ---- 5b) Update ML status (per-symbol, monotonic) ----
-            if mode in ("ml", "both") and ml_last_scored_ts is not None:
-                update_flow_ml_backfill_status(
-                    conn=conn,
+            except TypeError:
+                res = score_flow(
                     symbol=symbol,
                     kind=kind,
-                    last_ts=ml_last_scored_ts,
-                    run_id=run_id,
+                    tf=tf,
+                    df5=df_slice,
+                    base=base,
+                    ini_path=ini_path,
+                    context=None,
+                    force_ml=force_ml,
                 )
+
+            if not res:
+                continue
+
+            ts_scored = res[0]
+            rows = res[6] if (len(res) >= 7) else None
+
+            if rows:
+                batch_rows.extend(rows)
+
+            last_written_dt = ts_scored
+            scored += 1
+
+            # ✅ No universe pointer update mid-run
+            if rows and flush_every and len(batch_rows) >= flush_every:
+                if "dedupe_rows" in globals():
+                    batch_rows = dedupe_rows(batch_rows)
+                write_values(batch_rows)
+                batch_rows.clear()
+
+        if batch_rows:
+            if "dedupe_rows" in globals():
+                batch_rows = dedupe_rows(batch_rows)
+            write_values(batch_rows)
+            batch_rows.clear()
+
+        # ✅ Capture pointer ONLY from 15m
+        if tf == "15m" and last_written_dt:
+            final_last_ts_15m = last_written_dt
+
+        print(f"[DONE] {symbol} {kind} mode={mode} tf={tf} scored={scored} last={last_written_dt}")
+
+    # ✅ Update universe pointer ONCE per symbol run (15m only)
+    if final_last_ts_15m:
+        update_flow_last_ts(symbol, kind, mode, final_last_ts_15m)
+        print(f"[RESUME_PTR] {symbol} {kind} mode={mode} set={final_last_ts_15m} (from tf=15m)")
+
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--symbol", default="", help="Single symbol (if not using --all-symbols)")
+    ap.add_argument("--all-symbols", action="store_true", help="Run for all symbols in universe filter")
+    ap.add_argument("--universe-where", default="enabled = TRUE", help="SQL WHERE for reference.symbol_universe")
+
+    ap.add_argument("--limit", type=int, default=0, help="limit universe symbols")
+    ap.add_argument("--kind", default="futures", choices=["spot", "futures"])
+    ap.add_argument("--mode", choices=["rules", "ml", "fused"], default="rules")
+
+    ap.add_argument("--resume", action="store_true", help="Resume from universe flow_*_last_*_ts columns")
+
+    ap.add_argument("--tfs", default="15m,30m,60m,120m,240m")
+    ap.add_argument("--lookback-days", type=int, default=180)
+
+    ap.add_argument("--ini", required=True)
+    ap.add_argument("--run-id", default=f"FLOW_BACKFILL_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    ap.add_argument("--from-ts", default="")
+    ap.add_argument("--max-bars", type=int, default=0)
+    ap.add_argument("--flush-every", type=int, default=1500)
+    ap.add_argument("--use-target-until", action="store_true")
+
+    args = ap.parse_args()
+
+    tfs = [x.strip() for x in args.tfs.split(",") if x.strip()]
+    from_ts = parse_dt(args.from_ts)
+
+    if args.all_symbols:
+        symbols = get_symbols(args.universe_where, args.limit)
+    else:
+        symbols = [args.symbol.strip().upper()] if args.symbol else get_symbols(args.universe_where, args.limit)
+
+    if not symbols:
+        raise SystemExit("No symbols selected. Use --symbol or --all-symbols or relax --universe-where.")
+
+    print(f"[FLOW_BACKFILL] symbols={len(symbols)} kind={args.kind} mode={args.mode} tfs={tfs} run_id={args.run_id} resume={args.resume}")
+
+    for s in symbols:
+        try:
+            backfill_symbol(
+                symbol=s,
+                kind=args.kind,
+                mode=args.mode,
+                tfs=tfs,
+                lookback_days=args.lookback_days,
+                ini_path=args.ini,
+                run_id=args.run_id,
+                from_ts=from_ts,
+                max_bars=args.max_bars,
+                flush_every=args.flush_every,
+                use_target_until=args.use_target_until,
+                resume=args.resume,
+            )
+        except Exception as e:
+            print(f"[ERROR] {s} {args.kind}: {e}")
+            set_flow_error(s, args.kind, str(e))
 
 
 if __name__ == "__main__":
