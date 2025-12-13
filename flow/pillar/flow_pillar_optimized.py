@@ -130,12 +130,21 @@ def process_symbol_vectorized(
         return []
 
     # 2. Compute Features (Vectorized)
+    # Filter metrics for current TF
+    metrics_subset = metrics_df[metrics_df['interval'] == tf].copy() if not metrics_df.empty else pd.DataFrame()
+
     engine = FlowFeatureEngine(symbol, kind)
-    dftf = engine.compute_all_features(dftf, daily_df, metrics_df)
+    dftf = engine.compute_all_features(dftf, daily_df, metrics_subset)
 
     # 3. Score (Vectorized)
     scorer = VectorizedScorer(ini_path)
     score_cols = scorer.score(dftf)
+
+    # Drop existing score/veto columns if present to avoid overlap error
+    cols_to_drop = [c for c in ['score', 'veto'] if c in dftf.columns]
+    if cols_to_drop:
+        dftf = dftf.drop(columns=cols_to_drop)
+
     dftf = dftf.join(score_cols)
 
     # 4. Convert to Rows for DB
