@@ -117,6 +117,8 @@ def write_values_direct(rows: List[tuple]) -> None:
         dedup[key] = r
     rows_to_write = list(dedup.values())
 
+    print(f"[DB] Writing to table: indicators.values for {len(rows_to_write)} rows")
+
     sql = """
         INSERT INTO indicators.values
         (symbol, market_type, interval, ts, metric, val, context, run_id, source)
@@ -131,12 +133,13 @@ def write_values_direct(rows: List[tuple]) -> None:
 
     try:
         with get_db_connection() as conn:
+            # print(f"[DB] Connected to: {conn.dsn}")  # Optional: Uncomment if needed for connection details
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(
                     cur, sql, rows_to_write, page_size=1000
                 )
             conn.commit()
-            # print(f"[DB] Committed {len(rows_to_write)} rows to indicators.values")
+            print(f"[DB] Committed {len(rows_to_write)} rows successfully.")
     except Exception as e:
         print(f"[DB ERROR] Failed to write rows: {e}")
         import traceback
