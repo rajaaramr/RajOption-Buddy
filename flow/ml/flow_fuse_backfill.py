@@ -38,27 +38,36 @@ def _load_flow_ml_cfg(flow_ini_path: str | Path) -> Dict[str, Any]:
     return cfg
 
 
-def _load_flow_calibration() -> List[Dict[str, float]]:
+def _load_flow_calibration(target_name: str) -> List[Dict[str, float]]:
     """
-    Read calibration buckets from indicators.flow_calibration_4h.
+    Read calibration buckets from indicators.flow_calibration_4h for a specific target.
     """
     rows: List[Dict[str, float]] = []
     sql = """
         SELECT
+            bucket,
             p_min,
             p_max,
             realized_up_rate
         FROM indicators.flow_calibration_4h
+        WHERE target_name = %s
         ORDER BY p_min
     """
     try:
         with get_db_connection() as conn, conn.cursor() as cur:
-            cur.execute(sql)
-            for p_min, p_max, realized_up_rate in cur.fetchall():
+            cur.execute(sql, (target_name,))
+            results = cur.fetchall()
+            if not results:
+                # Fallback: try loading without target_name filter if specific not found?
+                # Or just warn. Let's warn.
+                print(f"[FLOW_FUSE] No calibration found for target={target_name}")
+
+            for bucket, p_min, p_max, realized_up_rate in results:
                 if realized_up_rate is None:
                     continue
                 rows.append(
                     {
+                        "bucket": int(bucket),
                         "p_min": float(p_min),
                         "p_max": float(p_max),
                         "realized_up_rate": float(realized_up_rate),
@@ -71,19 +80,12 @@ def _load_flow_calibration() -> List[Dict[str, float]]:
     return rows
 
 
-_CALIB_BUCKETS: Optional[List[Dict[str, float]]] = None
-
-
-def _calibrate_prob(p: Optional[float]) -> float:
+def _calibrate_prob_and_bucket(p: Optional[float], buckets: List[Dict[str, float]]) -> tuple[float, int]:
     """
-    Map raw prob -> calibrated prob using bucket stats.
-    If calibration not available, return p unchanged (clamped).
+    Map raw prob -> (calibrated prob, bucket_id).
     """
-    global _CALIB_BUCKETS
-
     if p is None:
-        return 0.0
-
+        p = 0.0
     try:
         if not np.isfinite(p):
             p = 0.0
@@ -92,27 +94,28 @@ def _calibrate_prob(p: Optional[float]) -> float:
 
     p = max(0.0, min(1.0, float(p)))
 
-    if _CALIB_BUCKETS is None:
-        _CALIB_BUCKETS = _load_flow_calibration()
-
-    buckets = _CALIB_BUCKETS or []
     if not buckets:
-        return p
+        # Default fallback if no calibration
+        return p, 0
 
     for row in buckets:
         p_min = row.get("p_min", 0.0)
         p_max = row.get("p_max", 1.0)
         if p_min <= p < p_max:
             cal = row.get("realized_up_rate", p)
+            bucket = int(row.get("bucket", 0))
             if cal is None or not np.isfinite(cal):
-                return p
-            return max(0.0, min(1.0, float(cal)))
+                return p, bucket
+            return max(0.0, min(1.0, float(cal))), bucket
 
+    # If above max range, use last bucket
     last = buckets[-1]
     cal = last.get("realized_up_rate", p)
+    bucket = int(last.get("bucket", 0))
+
     if cal is None or not np.isfinite(cal):
-        return p
-    return max(0.0, min(1.0, float(cal)))
+        return p, bucket
+    return max(0.0, min(1.0, float(cal))), bucket
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -233,6 +236,7 @@ def _load_rules_and_ml(
 def _fuse_row(
     row: pd.Series,
     cfg: Dict[str, Any],
+    buckets: List[Dict[str, float]],
 ) -> Dict[str, Any]:
     """
     Take one joined row → compute ml_score, fused_score, fused_veto.
@@ -244,12 +248,8 @@ def _fuse_row(
     ml_prob_raw = _safe_float(row["prob_up"], 0.0)
     ml_prob_raw = max(0.0, min(1.0, ml_prob_raw))
 
-    ml_prob_cal = _calibrate_prob(ml_prob_raw)
+    ml_prob_cal, ml_bucket = _calibrate_prob_and_bucket(ml_prob_raw, buckets)
     ml_score = round(100.0 * ml_prob_cal, 2)
-
-    # Calculate ML Bucket (1: Bearish to 5: Bullish)
-    # 0-20, 20-40, 40-60, 60-80, 80-100
-    ml_bucket = min(5, max(1, int(ml_score / 20.0) + 1))
 
     base_prob = rules_score / 100.0
     w = cfg["blend_weight"]
@@ -320,6 +320,11 @@ def _run_backfill(
     )
 
     cfg = _load_flow_ml_cfg(flow_ini)
+
+    # Load calibration buckets for this target
+    buckets = _load_flow_calibration(target_name)
+    print(f"[FLOW_FUSE] Loaded {len(buckets)} calibration buckets for {target_name}")
+
     df = _load_rules_and_ml(
         market_type=market_type,
         tf=tf,
@@ -341,7 +346,7 @@ def _run_backfill(
         tf_row = row["tf"]
         ts = row["ts"].to_pydatetime().replace(tzinfo=TZ)
 
-        fused = _fuse_row(row, cfg)
+        fused = _fuse_row(row, cfg, buckets)
 
         # Save last ts per symbol for status update
         prev = last_ts_per_symbol.get(sym)
