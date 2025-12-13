@@ -143,6 +143,9 @@ def load_flow_features_and_returns(
         SELECT
             f.symbol,
             f.ts,
+            f.open,
+            f.high,
+            f.low,
             f.close,
             f.volume,
             f.oi,
@@ -163,6 +166,9 @@ def load_flow_features_and_returns(
             'futures'   AS market_type,
 
             -- price & target
+            b.open,
+            b.high,
+            b.low,
             b.close,
             b.volume,
             b.oi,
