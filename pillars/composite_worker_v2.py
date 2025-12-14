@@ -30,7 +30,7 @@ DEFAULT_COMP_INI = os.getenv("COMPOSITE_V2_INI", "composite_v2.ini")
 
 # Pillars
 from pillars.common import clamp, now_ts, ensure_min_bars
-from pillars.trend_pillar import score_trend
+from Trend.Pillar.trend_pillar import score_trend
 from pillars.momentum_pillar import score_momentum
 from pillars.quality_pillar import score_quality
 from pillars.flow_pillar import score_flow
