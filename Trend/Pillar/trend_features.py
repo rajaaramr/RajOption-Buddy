@@ -13,9 +13,15 @@ class TrendFeatureEngine:
         self.symbol = symbol
         self.kind = kind
 
-    def compute_all_features(self, df: pd.DataFrame, daily_df: pd.DataFrame, metrics_df: pd.DataFrame) -> pd.DataFrame:
+    def compute_all_features(self, df: pd.DataFrame, daily_df: pd.DataFrame, metrics_df: pd.DataFrame, cfg: Dict[str, Any] = None) -> pd.DataFrame:
         """
         Computes all trend features and returns the dataframe with added columns.
+
+        Args:
+            df: Intraday dataframe (15m usually)
+            daily_df: Daily context (optional)
+            metrics_df: Metrics for context (optional)
+            cfg: Configuration dictionary containing window parameters
         """
         if df.empty:
             return df
@@ -27,28 +33,28 @@ class TrendFeatureEngine:
         c = df["close"]
         h = df["high"]
         l = df["low"]
-        o = df["open"]
         v = df.get("volume", pd.Series(0, index=df.index)).fillna(0)
 
         # ---------------------------------------------------------
         # 1. Configurable Parameters (Matching Trend V2 / INI defaults)
         # ---------------------------------------------------------
-        # These should match the INI defaults if not overridden,
-        # but for the engine we can hardcode standard defaults or pass config.
-        # We will assume standard defaults here which map to the INI 'ema_fast', etc.
-        p_ema_fast = 10
-        p_ema_mid = 20
-        p_ema_slow = 50
-        p_adx_main = 14
-        p_adx_fast = 9
-        p_roc_win = 5
-        p_atr_win = 14
-        p_bb_win = 20
-        p_bb_k = 2.0
-        p_kc_win = 20
-        p_kc_mult = 1.5
-        p_vol_avg = 20
-        p_div_n = 4  # Default lookback for divergence (~1h on 15m)
+        # Use provided cfg or fall back to defaults
+        if cfg is None:
+            cfg = {}
+
+        p_ema_fast = cfg.get("ema_fast", 10)
+        p_ema_mid = cfg.get("ema_mid", 20)
+        p_ema_slow = cfg.get("ema_slow", 50)
+        p_adx_main = cfg.get("adx_main", 14)
+        p_adx_fast = cfg.get("adx_fast", 9)
+        p_roc_win = cfg.get("roc_win", 5)
+        p_atr_win = cfg.get("atr_win", 14)
+        p_bb_win = cfg.get("bb_win", 20)
+        p_bb_k = cfg.get("bb_k", 2.0)
+        p_kc_win = cfg.get("kc_win", 20)
+        p_kc_mult = cfg.get("kc_mult", 1.5)
+        p_vol_avg = cfg.get("vol_avg_win", 20)
+        p_div_n = cfg.get("div_lookback", 5) # Default changed to 5 per INI
 
         # ---------------------------------------------------------
         # 2. Indicators
@@ -63,11 +69,18 @@ class TrendFeatureEngine:
         df["volume_avg_20"] = v.rolling(p_vol_avg).mean()
 
         # MACD (12, 26, 9)
+        # Note: MACD standard params (12, 26, 9) are usually fixed, but could be configurable if needed.
+        # Assuming standard for now as V2 didn't expose them in main config block explicitly?
+        # V2 code: ema(c, 12) - ema(c, 26).
         macd_line = ema(c, 12) - ema(c, 26)
         macd_sig = macd_line.ewm(span=9, adjust=False).mean()
         df["macd_line"] = macd_line
         df["macd_sig"] = macd_sig
-        df["hist_diff"] = macd_line - macd_sig
+
+        # FIX: hist_diff is delta of histogram, not histogram itself
+        hist = macd_line - macd_sig
+        df["hist"] = hist # Store raw hist if needed
+        df["hist_diff"] = hist.diff() # The change in histogram (rising/falling)
 
         # ATR
         ATR = atr(h, l, c, p_atr_win)
@@ -90,10 +103,7 @@ class TrendFeatureEngine:
         df["roc"] = c.pct_change(p_roc_win)
 
         # ROC/ATR Ratio (roc_abs_over_atr_ratio)
-        # Ratio = |ROC%| / (ATR% / 100) -> wait.
-        # V2 logic: abs(roc) / (atr_val / last_c)
-        # roc is pct_change (e.g. 0.01 for 1%). atr_val/last_c is e.g. 0.01 for 1%.
-        # So Ratio ~ 1.0 means move is 1 ATR.
+        # Ratio = |ROC%| / (ATR% / 100)
         atr_fraction = ATR / safe_c
         df["roc_abs_over_atr_ratio"] = df["roc"].abs() / atr_fraction.replace(0, np.nan)
 
@@ -111,9 +121,6 @@ class TrendFeatureEngine:
 
         # Squeeze Flag
         # Squeeze ON if BB is inside KC
-        # i.e., bb_up < kc_up AND bb_lo > kc_lo
-        # Or simply width comparison if centered? Usually checks bandwidth.
-        # V2 logic: squeeze = 1 if (bb_up - bb_lo) < (kc_up - kc_lo) else 0
         bb_width = df["bb_up"] - df["bb_lo"]
         kc_width = df["kc_up"] - df["kc_lo"]
         df["squeeze_flag"] = (bb_width < kc_width).astype(int)
@@ -131,14 +138,11 @@ class TrendFeatureEngine:
         df["adx14_prev"] = df["adx14"].shift(1)
         df["bb_width_pct_prev"] = df["bb_width_pct"].shift(1)
 
-        # Divergence Lookbacks
+        # Divergence Lookbacks (Using configurable p_div_n)
         df["rsi_prev_n"] = df["rsi_now"].shift(p_div_n)
         df["close_prev_n"] = c.shift(p_div_n)
 
         # Slopes (Normalized: % change over 5 bars)
-        # V2 logic: (s - s.shift(5)) / s * 100 (approx)
-        # Actually V2 used: (s.iloc[-1] - s.iloc[-5]) / s.iloc[-1] * 100
-        # For vectorization: (s - s.shift(5)) / s * 100
         def _calc_slope(s):
             return (s - s.shift(5)) / s.replace(0, np.nan) * 100.0
 
@@ -147,38 +151,45 @@ class TrendFeatureEngine:
         df["slope_long"] = _calc_slope(df["ema50"])
 
         # ---------------------------------------------------------
-        # 4. Booleans / Logical Flags (for easier Rules)
+        # 4. Booleans / Logical Flags
         # ---------------------------------------------------------
         df["dip_gt_dim"] = df["pdi"] > df["mdi"]
 
-        # POC Distance (Requires context/metrics, handled via simple column if available, else 0)
-        # If 'metrics_df' has POC data, we could merge it.
-        # For now, we'll placeholder or extract from metrics if the pattern allows.
-        # The V2 passed 'context'. Here we usually pass 'metrics_df' and forward fill.
-        # But 'process_symbol_vectorized' passes 'metrics_df'.
-
-        if not metrics_df.empty and 'metric' in metrics_df.columns:
-            # Filter for VP.POC
+        # POC Distance
+        # Safer merge logic to avoid index corruption
+        if metrics_df is not None and not metrics_df.empty and 'metric' in metrics_df.columns:
             poc_df = metrics_df[metrics_df['metric'] == 'VP.POC'].copy()
             if not poc_df.empty:
-                # Merge POC onto main df by timestamp (asof)
-                # Ensure ts is datetime and sorted
                 poc_df = poc_df.sort_values('ts')
-                df = pd.merge_asof(df.sort_index(), poc_df[['ts', 'val']], left_index=True, right_on='ts', direction='backward')
-                df = df.rename(columns={'val': 'poc_price'})
-                df.index = df['ts'] # Restore index
-                df = df.drop(columns=['ts'])
+                # Use merge_asof directly on copies to get aligned values
+                # We want to match candle timestamp with most recent POC
 
-                # Compute Distance
-                dist = (df['close'] - df['poc_price']).abs()
+                # Reset index to allow merge (merge_asof needs sorted column)
+                df_temp = df.reset_index() # assumes 'ts' is index
+                if 'ts' not in df_temp.columns and 'index' in df_temp.columns:
+                    df_temp = df_temp.rename(columns={'index': 'ts'})
+
+                # Merge
+                merged = pd.merge_asof(
+                    df_temp,
+                    poc_df[['ts', 'val']],
+                    on='ts',
+                    direction='backward',
+                    allow_exact_matches=True
+                )
+
+                # Extract aligned POC
+                aligned_poc = merged['val'].values # array
+
+                # Assign back to original DF (length matches)
+                # Compute distance
+                dist = np.abs(df['close'].values - aligned_poc)
                 df['poc_dist_atr'] = dist / ATR.replace(0, np.nan)
+
             else:
                 df['poc_dist_atr'] = 0.0
         else:
             df['poc_dist_atr'] = 0.0
-
-        # Fill NaNs where appropriate (e.g. initial bars)
-        # For rules, NaNs usually cause False, which is fine.
 
         return df
 
