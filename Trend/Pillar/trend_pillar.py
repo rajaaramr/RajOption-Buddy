@@ -68,29 +68,44 @@ class VectorizedScorer:
     def __init__(self, ini_path: Path):
         self.config = _cfg(ini_path)
 
-    def score(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def score(self, df: pd.DataFrame, track_scenarios: bool = False) -> Tuple[pd.DataFrame, Dict[str, pd.Series]]:
         """
         Applies scoring rules to the dataframe.
         Returns:
             df_scores: DataFrame with 'score', 'veto' columns.
+            fired_scenarios: Dictionary of {scenario_name: Series(score)} if track_scenarios=True
         """
         # Initialize score to 0
         df['score'] = 0.0
         df['veto'] = False
 
+        fired_scenarios = {}
+
         # Evaluate each scenario
         for scen in self.config["scenarios"]:
+            name = scen["name"]
             # Main condition
             if scen["when"]:
                 try:
                     mask = df.eval(scen["when"])
                     if isinstance(mask, pd.Series):
                         # Apply score
-                        df.loc[mask, 'score'] += scen["score"]
+                        score_val = scen["score"]
+                        df.loc[mask, 'score'] += score_val
 
                         # Apply veto
                         if scen["set_veto"]:
                             df.loc[mask, 'veto'] = True
+
+                        # Track firing
+                        if track_scenarios:
+                            # Initialize with 0
+                            s_series = pd.Series(0.0, index=df.index)
+                            s_series.loc[mask] = score_val
+                            if name in fired_scenarios:
+                                fired_scenarios[name] += s_series
+                            else:
+                                fired_scenarios[name] = s_series
                 except Exception:
                     pass
 
@@ -99,14 +114,21 @@ class VectorizedScorer:
                 try:
                     mask_bonus = df.eval(scen["bonus_when"])
                     if isinstance(mask_bonus, pd.Series):
-                        df.loc[mask_bonus, 'score'] += scen["bonus"]
+                        bonus_val = scen["bonus"]
+                        df.loc[mask_bonus, 'score'] += bonus_val
+
+                        if track_scenarios:
+                            bonus_name = f"{name}_bonus"
+                            b_series = pd.Series(0.0, index=df.index)
+                            b_series.loc[mask_bonus] = bonus_val
+                            fired_scenarios[bonus_name] = b_series
                 except Exception:
                     pass
 
         # Clamp scores
         df['score'] = df['score'].clip(self.config["clamp_low"], self.config["clamp_high"])
 
-        return df[['score', 'veto']]
+        return df[['score', 'veto']], fired_scenarios
 
 def process_symbol_vectorized(
     symbol: str,
@@ -138,8 +160,17 @@ def process_symbol_vectorized(
     dftf = engine.compute_all_features(dftf, daily_df, metrics_df)
 
     # 3. Score (Vectorized Rules)
+    # Check if debug scenarios requested
+    # We should add this to INI parser, but checking kwarg from INI if we had config passed.
+    # _cfg function parses "trend" section, we can check a var there.
+    # Re-read raw parser or add to _cfg_cached?
+    # Let's assume write_scenarios_debug is in [trend]
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), strict=False)
+    cp.read(ini_path)
+    write_debug = cp.getboolean("trend", "write_scenarios_debug", fallback=False)
+
     scorer = VectorizedScorer(ini_path)
-    score_cols = scorer.score(dftf)
+    score_cols, fired_scenarios = scorer.score(dftf, track_scenarios=write_debug)
 
     # Drop existing score/veto columns if present to avoid overlap error
     cols_to_drop = [c for c in ['score', 'veto'] if c in dftf.columns]
@@ -147,6 +178,13 @@ def process_symbol_vectorized(
         dftf = dftf.drop(columns=cols_to_drop)
 
     dftf = dftf.join(score_cols)
+
+    # If tracking scenarios, add them to dftf for row iteration or join?
+    # dftf usually wide.
+    if write_debug and fired_scenarios:
+        for name, ser in fired_scenarios.items():
+            col_name = f"__scen_{name}"
+            dftf[col_name] = ser
 
     # 4. ML Integration (Vectorized Lookup)
     # In Flow, we lookup pre-computed ML probs from DB.
@@ -180,8 +218,18 @@ def process_symbol_vectorized(
 
     target_cols = ['ts', 'score', 'veto_val', 'score_final', 'veto_final_val']
 
-    # Debug context columns to extract
-    debug_cols = ['ema10', 'ema20', 'ema50', 'adx14'] # Add others as needed
+    # Debug context columns to extract (TRD-07 requirements)
+    debug_cols = [
+        'ema10', 'ema20', 'ema50',
+        'adx14',
+        'slope_short', 'slope_mid', 'slope_long',
+        'squeeze_flag',
+        'rsi_now',
+        'dip_gt_dim'
+    ]
+
+    # Identify scenario columns
+    scen_cols = [c for c in dftf.columns if c.startswith("__scen_")] if write_debug else []
 
     for row in dftf.itertuples(index=False):
         # We need to access columns by name safely, itertuples returns a namedtuple
@@ -202,8 +250,24 @@ def process_symbol_vectorized(
         rows.append((symbol, kind, tf, ts_py, "TREND.veto_final", float(veto_final_val), "{}", run_id, source))
 
         # Debug Context
-        ctx = {k: float(getattr(row, k, 0.0)) for k in debug_cols}
+        ctx = {}
+        for k in debug_cols:
+            val = getattr(row, k, 0.0)
+            # handle boolean
+            if isinstance(val, (bool, np.bool_)):
+                val = 1.0 if val else 0.0
+            ctx[k] = float(val)
+
         rows.append((symbol, kind, tf, ts_py, "TREND.debug_ctx", 0.0, json.dumps(ctx), run_id, source))
+
+        # Scenario Debugging
+        if write_debug:
+            for sc in scen_cols:
+                val = getattr(row, sc, 0.0)
+                if val != 0:
+                    # Strip prefix __scen_
+                    real_name = sc.replace("__scen_", "")
+                    rows.append((symbol, kind, tf, ts_py, f"TREND.scenario.{real_name}", float(val), "{}", run_id, source))
 
     return rows
 
