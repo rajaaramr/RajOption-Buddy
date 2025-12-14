@@ -4,7 +4,8 @@ import configparser
 import functools
 import json
 import pandas as pd
-from typing import Dict, Any, List, Tuple
+import numpy as np
+from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
 
 from Trend.Pillar.trend_features import TrendFeatureEngine
@@ -20,11 +21,20 @@ def _cfg_cached(path_str: str, mtime_ns: int) -> dict:
     cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None, strict=False)
     cp.read(path_str)
 
-    # Extract rules
+    # Parse list of scenarios
+    scenario_list_raw = cp.get("trend_scenarios", "list", fallback="")
+    allowed_scenarios = {s.strip() for s in scenario_list_raw.replace("\n", ",").split(",") if s.strip()}
+
+    # Extract rules (only if in list)
     scenarios = []
     for section in cp.sections():
         if section.startswith("trend_scenario."):
             name = section.replace("trend_scenario.", "")
+
+            # TRD-Fix-05: Enforce list control
+            if name not in allowed_scenarios:
+                continue
+
             when = cp.get(section, "when", fallback="").strip()
             score = cp.getfloat(section, "score", fallback=0.0)
             bonus_when = cp.get(section, "bonus_when", fallback="").strip()
@@ -39,6 +49,9 @@ def _cfg_cached(path_str: str, mtime_ns: int) -> dict:
                 "bonus": bonus,
                 "set_veto": set_veto
             })
+
+    # TRD-Fix-07: Parse write_scenarios_debug once
+    write_debug = cp.getboolean("trend", "write_scenarios_debug", fallback=False)
 
     # ML Config
     ml_cfg = {}
@@ -58,7 +71,8 @@ def _cfg_cached(path_str: str, mtime_ns: int) -> dict:
         "clamp_low": cp.getfloat("trend", "clamp_low", fallback=0.0),
         "clamp_high": cp.getfloat("trend", "clamp_high", fallback=100.0),
         "ml": ml_cfg,
-        "min_bars": cp.getint("trend", "min_bars", fallback=120)
+        "min_bars": cp.getint("trend", "min_bars", fallback=120),
+        "write_debug": write_debug
     }
 
 def _cfg(path: Path) -> dict:
@@ -85,10 +99,11 @@ class VectorizedScorer:
         # Evaluate each scenario
         for scen in self.config["scenarios"]:
             name = scen["name"]
+            # TRD-Fix-08: Use numexpr engine
             # Main condition
             if scen["when"]:
                 try:
-                    mask = df.eval(scen["when"])
+                    mask = df.eval(scen["when"], engine='numexpr')
                     if isinstance(mask, pd.Series):
                         # Apply score
                         score_val = scen["score"]
@@ -108,23 +123,52 @@ class VectorizedScorer:
                             else:
                                 fired_scenarios[name] = s_series
                 except Exception:
-                    pass
+                    # Fallback to default engine if numexpr fails (e.g. missing op)
+                    try:
+                        mask = df.eval(scen["when"])
+                        if isinstance(mask, pd.Series):
+                            score_val = scen["score"]
+                            df.loc[mask, 'score'] += score_val
+                            if scen["set_veto"]:
+                                df.loc[mask, 'veto'] = True
+                            if track_scenarios:
+                                s_series = pd.Series(0.0, index=df.index)
+                                s_series.loc[mask] = score_val
+                                if name in fired_scenarios:
+                                    fired_scenarios[name] += s_series
+                                else:
+                                    fired_scenarios[name] = s_series
+                    except Exception:
+                        pass
 
             # Bonus condition
             if scen["bonus_when"]:
                 try:
-                    mask_bonus = df.eval(scen["bonus_when"])
+                    mask_bonus = df.eval(scen["bonus_when"], engine='numexpr')
                     if isinstance(mask_bonus, pd.Series):
                         bonus_val = scen["bonus"]
                         df.loc[mask_bonus, 'score'] += bonus_val
 
                         if track_scenarios:
-                            bonus_name = f"{name}_bonus"
+                            # TRD-Fix-12: Use .bonus suffix
+                            bonus_name = f"{name}.bonus"
                             b_series = pd.Series(0.0, index=df.index)
                             b_series.loc[mask_bonus] = bonus_val
                             fired_scenarios[bonus_name] = b_series
                 except Exception:
-                    pass
+                    try:
+                        mask_bonus = df.eval(scen["bonus_when"])
+                        if isinstance(mask_bonus, pd.Series):
+                            bonus_val = scen["bonus"]
+                            df.loc[mask_bonus, 'score'] += bonus_val
+
+                            if track_scenarios:
+                                bonus_name = f"{name}.bonus"
+                                b_series = pd.Series(0.0, index=df.index)
+                                b_series.loc[mask_bonus] = bonus_val
+                                fired_scenarios[bonus_name] = b_series
+                    except Exception:
+                        pass
 
         # Clamp scores
         df['score'] = df['score'].clip(self.config["clamp_low"], self.config["clamp_high"])
@@ -228,17 +272,23 @@ def process_symbol_vectorized(
     # Filter metrics for current TF if necessary (though features currently use simple filter inside)
     # The feature engine expects metrics_df potentially containing 'VP.POC' etc.
     engine = TrendFeatureEngine(symbol, kind)
-    dftf = engine.compute_all_features(dftf, daily_df, metrics_df)
-
-    # 3. Score (Vectorized Rules)
-    # Check if debug scenarios requested
-    # We should add this to INI parser, but checking kwarg from INI if we had config passed.
-    # _cfg function parses "trend" section, we can check a var there.
-    # Re-read raw parser or add to _cfg_cached?
-    # Let's assume write_scenarios_debug is in [trend]
+    # TRD-Fix-03: Pass cfg to feature engine
+    # Let's re-read config efficiently.
     cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), strict=False)
     cp.read(ini_path)
-    write_debug = cp.getboolean("trend", "write_scenarios_debug", fallback=False)
+    trend_params = {k: v for k, v in cp.items("trend")} if cp.has_section("trend") else {}
+    # Convert numeric
+    for k in trend_params:
+        try: trend_params[k] = float(trend_params[k])
+        except: pass
+        try: trend_params[k] = int(trend_params[k])
+        except: pass
+
+    dftf = engine.compute_all_features(dftf, daily_df, metrics_df, cfg=trend_params)
+
+    # 3. Score (Vectorized Rules)
+    # TRD-Fix-07: Use cached write_debug
+    write_debug = cfg.get("write_debug", False)
 
     scorer = VectorizedScorer(ini_path)
     score_cols, fired_scenarios = scorer.score(dftf, track_scenarios=write_debug)
@@ -279,70 +329,106 @@ def process_symbol_vectorized(
         ml_df = _fetch_ml_scores(symbol, kind, tf, target, version, start_ts, end_ts)
 
         if not ml_df.empty:
-             # Merge (left join to keep all dftf rows)
-            # Use merge_asof or join? ML timestamps should match candle timestamps exactly usually.
-            # But just in case, a join on index is safest if indices are aligned.
-            dftf = dftf.join(ml_df, how='left')
-            # 'prob_up' is now in dftf
+             # Merge (TRD-Fix-10: safer join)
+             # Use merge_asof if indices are close but not exact, or simple join if exact.
+             # ML data usually 15m aligned.
+             # Ensure indices are timezone aware/naive consistent.
+             # We assume both are datetime indexes.
 
-            # Fill missing ML with default (e.g. 0.5 or 0) - or handle logic.
-            # If missing, we revert to rule score?
-            # Let's fill with NaN and handle below
+             # Check index overlap
+             # dftf = dftf.join(ml_df, how='left')
 
-            # Load Calibration
-            cal_table = ml_cfg.get("calibration_table", "")
-            buckets = _fetch_calibration_data(cal_table) if cal_table else []
+             # Better: merge_asof with small tolerance to handle slight clock skews
+             # Reset index for merge
+             dftf_reset = dftf.reset_index()
+             if 'ts' not in dftf_reset.columns and 'index' in dftf_reset.columns:
+                 dftf_reset = dftf_reset.rename(columns={'index': 'ts'})
 
-            # Vectorized Calibration (apply per row is slow, but buckets are small)
-            # We can use pd.cut or apply. Given small buckets, apply is fine or a vectorized lookup.
-            # Let's use apply for simplicity now, or optimize if bucket counts grow.
-            if 'prob_up' in dftf.columns:
-                 # Calculate Calibrated Probs
-                 # Handle NaNs (missing ML) -> Default to neutral 0.5 or skip blend?
-                 # If NaN, we likely shouldn't veto or boost.
+             ml_df_reset = ml_df.reset_index().rename(columns={'index': 'ts'})
 
-                 def get_cal_prob(p):
-                     if pd.isna(p): return 0.5 # Neutral
-                     return _calibrate_prob(p, buckets)
+             # Sort keys
+             dftf_reset = dftf_reset.sort_values('ts')
+             ml_df_reset = ml_df_reset.sort_values('ts')
 
-                 dftf['ml_prob_raw'] = dftf['prob_up'].fillna(0.5)
-                 dftf['ml_p_up_cal'] = dftf['prob_up'].apply(get_cal_prob)
-                 dftf['ml_p_down_cal'] = 1.0 - dftf['ml_p_up_cal']
+             # Merge asof
+             merged = pd.merge_asof(
+                 dftf_reset,
+                 ml_df_reset[['ts', 'prob_up']],
+                 on='ts',
+                 tolerance=pd.Timedelta("5m"), # 5m tolerance
+                 direction='nearest'
+             )
 
-                 # Blending
-                 # base_prob = TREND.score / 100
-                 # final_prob = (1 - w) * base_prob + w * ml_p_up_cal
-                 w = ml_cfg.get("blend_weight", 0.0)
-                 w = max(0.0, min(1.0, w))
+             # Restore index
+             dftf = merged.set_index('ts')
 
-                 base_prob = dftf['score'] / 100.0
-                 final_prob = (1.0 - w) * base_prob + w * dftf['ml_p_up_cal']
-                 dftf['score_final'] = final_prob * 100.0
-                 dftf['score_final'] = dftf['score_final'].clip(cfg["clamp_low"], cfg["clamp_high"])
+             # Fill missing ML with default (e.g. 0.5 or 0) - or handle logic.
+             # If missing, we revert to rule score?
+             # Let's fill with NaN and handle below
 
-                 # Veto Logic
-                 # If final_prob < veto_threshold -> veto_final = 1
-                 # Else: veto_final = rules_veto
-                 veto_thresh = ml_cfg.get("veto_if_prob_lt", 0.35)
+             # Load Calibration
+             cal_table = ml_cfg.get("calibration_table", "")
+             buckets = _fetch_calibration_data(cal_table) if cal_table else []
 
-                 # If ML is missing (prob_up is NaN), do we veto?
-                 # Usually if ML missing, we shouldn't veto based on it.
-                 # Mask for valid ML
-                 has_ml = dftf['prob_up'].notna()
+             # Vectorized Calibration (apply per row is slow, but buckets are small)
+             # We can use pd.cut or apply. Given small buckets, apply is fine or a vectorized lookup.
+             # Let's use apply for simplicity now, or optimize if bucket counts grow.
+             if 'prob_up' in dftf.columns:
+                  # Calculate Calibrated Probs
+                  # Handle NaNs (missing ML) -> Default to neutral 0.5 or skip blend?
+                  # If NaN, we likely shouldn't veto or boost.
 
-                 # Apply ML Veto
-                 ml_veto = (final_prob < veto_thresh) & has_ml
+                  def get_cal_prob(p):
+                      if pd.isna(p): return 0.5 # Neutral
+                      return _calibrate_prob(p, buckets)
 
-                 # Combine with Rules Veto
-                 # Veto is True if (Rules Veto) OR (ML Veto)
-                 # Wait, user said: "Else: TREND.veto_final = rules veto"
-                 # So if ML Veto triggers, it overrides.
-                 dftf['veto_final'] = dftf['veto'] | ml_veto
+                  dftf['ml_prob_raw'] = dftf['prob_up'].fillna(0.5)
+                  dftf['ml_p_up_cal'] = dftf['prob_up'].apply(get_cal_prob)
+                  dftf['ml_p_down_cal'] = 1.0 - dftf['ml_p_up_cal']
 
-                 # Construct ML Context JSON
-                 # We need a vectorized way to create JSON string?
-                 # Or just do it in the loop below.
-                 # Doing it in loop is safer.
+                  # Blending
+                  # base_prob = TREND.score / 100
+                  # final_prob = (1 - w) * base_prob + w * ml_p_up_cal
+                  w = ml_cfg.get("blend_weight", 0.0)
+                  w = max(0.0, min(1.0, w))
+
+                  base_prob = dftf['score'] / 100.0
+                  final_prob = (1.0 - w) * base_prob + w * dftf['ml_p_up_cal']
+                  dftf['score_final'] = final_prob * 100.0
+                  dftf['score_final'] = dftf['score_final'].clip(cfg["clamp_low"], cfg["clamp_high"])
+
+                  # Veto Logic
+                  # TRD-Fix-06: ML veto softening
+                  # If final_prob < veto_if_prob_lt -> Force Veto
+                  # If final_prob >= soften_veto_if_prob_ge -> Soften Veto (Clear Rules Veto)
+                  # Else -> Keep Rules Veto
+
+                  veto_hard_thresh = ml_cfg.get("veto_if_prob_lt", 0.35)
+                  veto_soft_thresh = ml_cfg.get("soften_veto_if_prob_ge", 0.65)
+
+                  has_ml = dftf['prob_up'].notna()
+
+                  # 1. Hard Veto (Adds new veto)
+                  ml_hard_veto = (final_prob < veto_hard_thresh) & has_ml
+
+                  # 2. Soften Veto (Removes existing veto)
+                  ml_soft_veto = (final_prob >= veto_soft_thresh) & has_ml
+
+                  # Combine:
+                  # Start with Rules Veto
+                  current_veto = dftf['veto'].copy()
+
+                  # Apply Softening (If ML says strong buy, ignore weak rule vetoes?)
+                  # "ml_soften_veto_if_prob_ge" implies un-vetoing.
+                  current_veto = current_veto & (~ml_soft_veto)
+
+                  # Apply Hardening (If ML says strong sell, force veto)
+                  dftf['veto_final'] = current_veto | ml_hard_veto
+
+                  # Construct ML Context JSON
+                  # We need a vectorized way to create JSON string?
+                  # Or just do it in the loop below.
+                  # Doing it in loop is safer.
 
         # Drop temp columns if needed
         cols_to_drop = ['prob_up']
