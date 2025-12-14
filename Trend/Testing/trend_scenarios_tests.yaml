@@ -1,0 +1,55 @@
+# Trend/Testing/trend_scenarios_tests.yaml
+
+tests:
+  - name: "Bullish EMA Stack"
+    input:
+      close: 105.0
+      ema10: 102.0
+      ema20: 100.0
+      ema50: 95.0
+    expected:
+      scenario: "ema_bull_stack"
+      score_delta: 40
+
+  - name: "Bearish EMA Stack"
+    input:
+      close: 90.0
+      ema10: 92.0
+      ema20: 95.0
+      ema50: 100.0
+    expected:
+      scenario: "ema_bear_stack"
+      score_delta: 40
+
+  - name: "ADX Strong Up"
+    input:
+      adx14: 30.0
+      adx14_prev: 28.0
+      dip_gt_dim: True
+    expected:
+      scenario: "adx_strong_up"
+      score_delta: 20
+
+  - name: "ADX Weak"
+    input:
+      adx14: 15.0
+    expected:
+      scenario: "adx_weak"
+      score_delta: -5
+
+  - name: "MACD Bull Cross"
+    input:
+      macd_line: 0.5
+      macd_sig: 0.2
+      hist_diff: 0.1
+      macd_line_prev: -0.1 # Triggers bonus
+    expected:
+      scenario: "macd_bull_cross"
+      score_delta: 20 # 15 + 5 bonus
+
+  - name: "ATR Penalty High"
+    input:
+      atr_pct: 16.0
+    expected:
+      scenario: "atr_penalty_15"
+      score_delta: -15
