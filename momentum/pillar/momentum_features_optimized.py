@@ -12,7 +12,6 @@ import pandas as pd
 
 # Reuse common indicators/utils where possible
 from pillars.common import (
-    rsi as _calc_rsi,
     ema as _calc_ema,
     atr as _calc_atr,
     adx as _calc_adx,
@@ -21,6 +20,19 @@ from pillars.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _calc_rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    """Relative Strength Index (RSI)."""
+    if len(close) < 3:
+        return pd.Series([50.0] * len(close), index=close.index, dtype=float)
+    d = close.diff()
+    g = d.clip(lower=0)
+    l = (-d).clip(lower=0)
+    ema_g = g.ewm(alpha=1 / max(1, n), adjust=False).mean()
+    ema_l = l.ewm(alpha=1 / max(1, n), adjust=False).mean().replace(0, np.nan)
+    rs = ema_g / ema_l
+    out = 100 - 100 / (1 + rs)
+    return out.fillna(50.0)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INI = str(BASE_DIR / "momentum_scenarios.ini")
