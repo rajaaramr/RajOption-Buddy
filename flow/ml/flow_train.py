@@ -3,8 +3,9 @@
 import os
 import json
 import configparser
+import argparse
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime, timedelta, timezone, time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 from psycopg2.extras import execute_values
+from pandas.tseries.offsets import DateOffset
 
 from utils.db import get_db_connection
 from pillars.common import TZ
@@ -38,17 +40,6 @@ except Exception:
 class FlowMLTarget:
     """
     Configuration for a single FLOW ML target.
-
-    Example INI section:
-
-        [flow_ml.target.ret_2pct_4h]
-        enabled            = true
-        mode               = direction_threshold
-        base_tf            = 15m
-        horizon_bars       = 16
-        threshold_up_pct   = 2.0
-        threshold_down_pct = -2.0
-        min_hold_bars      = 4
     """
     name: str                   # full section name, e.g. "flow_ml.target.ret_2pct_4h"
     enabled: bool
@@ -116,6 +107,7 @@ def load_ml_targets_for_flow(
 def load_flow_features_and_returns(
     target: FlowMLTarget,
     lookback_days: int = 180,
+    force_all_data: bool = False,
 ) -> pd.DataFrame:
     """
     Build the training dataframe for a given FLOW ML target.
@@ -136,7 +128,12 @@ def load_flow_features_and_returns(
             f"Only base_tf='15m' supported initially, got {base_tf!r}"
         )
 
-    cutoff = datetime.now(TZ) - timedelta(days=lookback_days)
+    if force_all_data:
+        # Load essentially everything (e.g. 5 years)
+        cutoff = datetime.now(TZ) - timedelta(days=365 * 5)
+        print(f"[FLOW_ML] Loading ALL data (up to 5 years) for target={target.name}")
+    else:
+        cutoff = datetime.now(TZ) - timedelta(days=lookback_days)
 
     sql = """
     WITH base AS (
@@ -375,81 +372,159 @@ def build_up_label_direction_threshold(
 
 
 # ------------------------------------------------------------
-# 4) Orchestrator: train + write to DB
+# 4) Training Logic (Production vs Backfill)
 # ------------------------------------------------------------
 
-def train_and_write_all_flow_models(
-    targets_ini: str = ML_TARGETS_INI,
-    lookback_days: int = 180,
-    only_target: Optional[str] = None,
-):
+def prepare_features_and_labels(
+    df: pd.DataFrame, target: FlowMLTarget
+) -> Tuple[pd.DataFrame, pd.Series, List[str], pd.DataFrame]:
     """
-    1) Load targets from ml_targets.ini
-    2) For each enabled target (or one filtered by only_target):
-         - Load features + future_ret_pct
-         - Build labels
-         - Train XGB model
-         - Save model to disk
-         - Save models+features for infer_daily
-         - Write in-sample probabilities to indicators.ml_pillars
+    Common helper:
+    1. Build labels
+    2. Filter NA
+    3. Select numeric features
+    4. Fill NaN/Inf
+    Returns (X, y, feature_cols, df_clean)
     """
-    targets = load_ml_targets_for_flow(targets_ini)
-    if not targets:
-        print(f"[FLOW_ML] No [flow_ml.target.*] sections found in {targets_ini}")
-        return
-
-    for target in targets:
-        if not target.enabled:
-            continue
-        if only_target and target.name != only_target:
-            continue
-
-        print(
-            f"[FLOW_ML] Training target={target.name} "
-            f"base_tf={target.base_tf} horizon_bars={target.horizon_bars}"
+    # 1) Build labels
+    if target.mode == "direction_threshold":
+        y = build_up_label_direction_threshold(df, target)
+    else:
+        raise NotImplementedError(
+            f"Unsupported mode={target.mode} for target={target.name}"
         )
 
-        # 1) Load training dataframe
-        df = load_flow_features_and_returns(target, lookback_days=lookback_days)
+    # 2) Filter rows with valid label
+    mask = y.notna()
+    df_clean = df.loc[mask].copy()
+    y_clean = y.loc[mask]
 
-        # 2) Build labels (bullish direction for v1)
-        if target.mode == "direction_threshold":
-            y = build_up_label_direction_threshold(df, target)
-        else:
-            raise NotImplementedError(
-                f"Unsupported mode={target.mode} for target={target.name}"
-            )
+    if df_clean.empty:
+        return pd.DataFrame(), pd.Series(), [], pd.DataFrame()
 
-        mask = y.notna()
-        df = df.loc[mask]
-        y = y.loc[mask]
+    # 3) Build feature matrix X
+    drop_cols = {
+        "future_ret_pct",
+        "future_close",
+        "market_type",
+        "tf",
+        "symbol",
+        "ts_future",
+    }
 
-        # 3) Build feature matrix X
-        drop_cols = {
-            "future_ret_pct",
-            "future_close",
-            "market_type",
-            "tf",
-            # explicitly never used as features:
-            "symbol",
-        }
+    features_df = df_clean.drop(columns=[c for c in drop_cols if c in df_clean.columns])
+    features_df = features_df.select_dtypes(include=["number", "bool"])
+    feature_cols = list(features_df.columns)
 
-        # Start by dropping obvious non-feature columns
-        features_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+    X = features_df.copy()
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-        # Keep ONLY numeric / bool columns (drops any datetime, object etc.)
-        features_df = features_df.select_dtypes(include=["number", "bool"])
+    return X, y_clean, feature_cols, df_clean
 
-        feature_cols = list(features_df.columns)
 
-        X = features_df.copy()
-        X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+def train_model_production(target: FlowMLTarget, df: pd.DataFrame):
+    """
+    Mode: PRODUCTION
+    - Trains on ALL provided data.
+    - Saves .pkl models for runtime usage.
+    - DOES NOT write historical predictions to DB (avoids pollution).
+    """
+    print(f"[FLOW_ML] [PRODUCTION] Training final model for target={target.name}")
 
-        if X.empty:
-            print(f"[FLOW_ML] No usable features for target={target.name}, skipping")
+    X, y, feature_cols, _ = prepare_features_and_labels(df, target)
+
+    if X.empty:
+        print(f"[FLOW_ML] No usable features for target={target.name}, skipping")
+        return
+
+    # Train XGBoost
+    model = XGBClassifier(
+        max_depth=4,
+        n_estimators=200,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        n_jobs=4,
+    )
+    model.fit(X, y.values)
+
+    # Save artifact
+    save_flow_models_and_features(
+        target_name=target.name,
+        version=target.version,
+        model_up=model,
+        model_dn=model,
+        feature_cols=feature_cols,
+    )
+
+    # Optional: Print metrics (Accuracy on train set - purely informational)
+    preds = model.predict(X)
+    acc = (preds == y.values).mean()
+    print(f"[FLOW_ML] [PRODUCTION] In-sample Accuracy: {acc:.2%}")
+
+
+def train_model_backfill(
+    target: FlowMLTarget,
+    df: pd.DataFrame,
+    step_months: int = 1,
+    initial_train_months: int = 3
+):
+    """
+    Mode: BACKFILL (Rolling Walk-Forward)
+    - Loop: Train[Past] -> Predict[Next Month]
+    - Does NOT save .pkl models.
+    - Writes OOF probabilities to indicators.ml_pillars.
+    """
+    print(f"[FLOW_ML] [BACKFILL] Starting Rolling Walk-Forward for {target.name}...")
+
+    # Ensure index is sorted
+    df = df.sort_index()
+    if df.empty:
+        print("[FLOW_ML] No data to backfill.")
+        return
+
+    start_ts = df.index.min()
+    max_ts = df.index.max()
+
+    # Define start of the "Prediction" phase
+    # First training window = [start_ts, current_cursor)
+    # First prediction window = [current_cursor, current_cursor + step)
+
+    # Align cursor to start of a month for cleaner boundaries?
+    # Or just add offsets. Let's use offsets from start_ts.
+
+    current_cursor = start_ts + DateOffset(months=initial_train_months)
+
+    all_oof_rows = []
+
+    # Expanding Window Loop
+    while current_cursor < max_ts:
+        next_cursor = current_cursor + DateOffset(months=step_months)
+
+        # 1. Define Slices
+        # Train: Everything before current_cursor
+        train_mask = df.index < current_cursor
+        # Test: Everything in [current_cursor, next_cursor)
+        test_mask = (df.index >= current_cursor) & (df.index < next_cursor)
+
+        df_train = df.loc[train_mask]
+        df_test = df.loc[test_mask]
+
+        if df_train.empty or df_test.empty:
+            print(f"[FLOW_ML] Skipping window {current_cursor.date()} -> {next_cursor.date()} (insufficient data)")
+            current_cursor = next_cursor
             continue
 
-        # 4) Train XGBoost model
+        print(f"[FLOW_ML] Window: Train up to {current_cursor.date()} | Predict {current_cursor.date()} to {next_cursor.date()}")
+
+        # 2. Train Model
+        X_train, y_train, feature_cols, _ = prepare_features_and_labels(df_train, target)
+        if X_train.empty:
+            current_cursor = next_cursor
+            continue
+
         model = XGBClassifier(
             max_depth=4,
             n_estimators=200,
@@ -460,108 +535,171 @@ def train_and_write_all_flow_models(
             eval_metric="logloss",
             n_jobs=4,
         )
-        model.fit(X, y.values)
+        model.fit(X_train, y_train.values)
 
-        # 5) Save model to disk in legacy JSON format (optional)
-        os.makedirs("models/flow", exist_ok=True)
-        model_path = os.path.join("models", "flow", f"{target.name}_{target.version}.json")
-        model.save_model(model_path)
-        print(f"[FLOW_ML] Saved model → {model_path}")
+        # 3. Predict on Test (OOF)
+        # Use prepare_features_and_labels to get X_test and the aligned df_test_clean
+        X_test, _, _, df_test_clean = prepare_features_and_labels(df_test, target)
 
-        # 5b) Save models + features in the format expected by flow_infer_daily.py
-        # For now we use the same classifier for "up" and "down" (we don't train a separate
-        # down model yet). If we later add a dedicated down-model, we can wire it here.
-        save_flow_models_and_features(
-            target_name=target.name,
-            version=target.version,
-            model_up=model,
-            model_dn=model,
-            feature_cols=feature_cols,
-        )
+        # Re-align X_test columns to match X_train
+        missing_cols = set(feature_cols) - set(X_test.columns)
+        for c in missing_cols:
+            X_test[c] = 0.0
+        X_test = X_test[feature_cols] # Enforce order
 
-        # 6) In-sample probabilities (v1)
-        prob_long = model.predict_proba(X)[:, 1]
-        prob_short = 1.0 - prob_long
-
-        # 7) Prepare rows for indicators.ml_pillars
-        rows = []
-        for (ts, row), p_long, p_short in zip(df.iterrows(), prob_long, prob_short):
-            rows.append(
-                (
-                    row["symbol"],
-                    target.market_type,   # 'futures'
-                    "flow",               # pillar
-                    row["tf"],
-                    ts.to_pydatetime(),
-                    target.name,          # target_name (full INI section)
-                    target.version,
-                    float(p_long),
-                    float(p_short),
-                    float(row["future_ret_pct"]),
-                    json.dumps(
-                        {
-                            "base_tf": target.base_tf,
-                            "horizon_bars": target.horizon_bars,
-                            "features": feature_cols,
-                        }
-                    ),
-                )
-            )
-
-        if not rows:
-            print(f"[FLOW_ML] No rows to write for target={target.name}")
+        if X_test.empty:
+            current_cursor = next_cursor
             continue
 
-        sql = """
-            INSERT INTO indicators.ml_pillars
-                (symbol, market_type, pillar, tf, ts,
-                 target_name, version,
-                 prob_up, prob_down, future_ret_pct, context)
-            VALUES %s
-            ON CONFLICT (symbol, market_type, pillar, tf, ts, target_name, version)
-            DO UPDATE
-               SET prob_up       = EXCLUDED.prob_up,
-                   prob_down     = EXCLUDED.prob_down,
-                   future_ret_pct = EXCLUDED.future_ret_pct,
-                   context        = EXCLUDED.context,
-                   created_at     = now()
-        """
+        prob_long = model.predict_proba(X_test)[:, 1]
+        prob_short = 1.0 - prob_long
 
-        with get_db_connection() as conn, conn.cursor() as cur:
-            execute_values(cur, sql, rows, page_size=1000)
-            conn.commit()
+        # 4. Collect Results
+        context_json = json.dumps({
+            "base_tf": target.base_tf,
+            "horizon_bars": target.horizon_bars,
+            "features": feature_cols,
+            "mode": "backfill_oof"
+        })
 
-            # mark calibration time (if wired)
-            update_flow_ml_jobs_status(conn, calib_at=datetime.now(timezone.utc))
+        # Safely iterate over the aligned dataframe rows
+        for (idx, row), p_long, p_short in zip(df_test_clean.iterrows(), prob_long, prob_short):
+            all_oof_rows.append((
+                row["symbol"],
+                target.market_type,
+                "flow",
+                row["tf"],
+                idx.to_pydatetime(),
+                target.name,
+                target.version,
+                float(p_long),
+                float(p_short),
+                float(row["future_ret_pct"]),
+                context_json
+            ))
 
-        print(
-            f"[FLOW_ML] Wrote {len(rows)} rows into indicators.ml_pillars "
-            f"for target={target.name}"
-        )
+        # Move cursor
+        current_cursor = next_cursor
+
+    # 5. Bulk Write to DB
+    if not all_oof_rows:
+        print(f"[FLOW_ML] No OOF predictions generated for {target.name}")
+        return
+
+    print(f"[FLOW_ML] Writing {len(all_oof_rows)} OOF rows to indicators.ml_pillars for {target.name}...")
+
+    sql = """
+        INSERT INTO indicators.ml_pillars
+            (symbol, market_type, pillar, tf, ts,
+             target_name, version,
+             prob_up, prob_down, future_ret_pct, context)
+        VALUES %s
+        ON CONFLICT (symbol, market_type, pillar, tf, ts, target_name, version)
+        DO UPDATE
+           SET prob_up       = EXCLUDED.prob_up,
+               prob_down     = EXCLUDED.prob_down,
+               future_ret_pct = EXCLUDED.future_ret_pct,
+               context        = EXCLUDED.context,
+               created_at     = now()
+    """
+
+    with get_db_connection() as conn, conn.cursor() as cur:
+        execute_values(cur, sql, all_oof_rows, page_size=1000)
+        conn.commit()
+
+    print("[FLOW_ML] Backfill complete.")
 
 
 # ------------------------------------------------------------
-# 5) CLI
+# 5) Orchestrator
+# ------------------------------------------------------------
+
+def run_flow_ml_pipeline(
+    targets_ini: str = ML_TARGETS_INI,
+    lookback_days: int = 180,
+    only_target: Optional[str] = None,
+    mode: str = "production",
+    step_months: int = 1,
+):
+    """
+    Main entry point.
+    """
+    targets = load_ml_targets_for_flow(targets_ini)
+    if not targets:
+        print(f"[FLOW_ML] No targets found in {targets_ini}")
+        return
+
+    for target in targets:
+        if not target.enabled:
+            continue
+        if only_target and target.name != only_target:
+            continue
+
+        print(f"--- Processing Target: {target.name} (Mode: {mode.upper()}) ---")
+
+        # 1. Load Data
+        # For backfill, we force loading ALL data to enable the walk-forward loop
+        force_all = (mode == "backfill")
+
+        try:
+            df = load_flow_features_and_returns(
+                target,
+                lookback_days=lookback_days,
+                force_all_data=force_all
+            )
+        except RuntimeError as e:
+            print(f"[FLOW_ML] Data load error: {e}")
+            continue
+
+        # 2. Dispatch
+        if mode == "production":
+            train_model_production(target, df)
+        elif mode == "backfill":
+            train_model_backfill(
+                target,
+                df,
+                step_months=step_months,
+                initial_train_months=3 # First 3 months for initial training
+            )
+        else:
+            print(f"Unknown mode: {mode}")
+
+# ------------------------------------------------------------
+# 6) CLI
 # ------------------------------------------------------------
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--targets-ini", default=ML_TARGETS_INI,
                         help="Path to ml_targets.ini")
-    parser.add_argument("--lookback-days", type=int, default=180)
+    parser.add_argument("--lookback-days", type=int, default=180,
+                        help="Lookback days for production training")
     parser.add_argument(
         "--only-target",
         default=None,
-        help="Exact target section name, e.g. flow_ml.target.bull_2pct_4h",
+        help="Exact target section name",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["production", "backfill"],
+        default="production",
+        help="Mode: 'production' (train all, save model) or 'backfill' (rolling OOF, save DB)"
+    )
+    parser.add_argument(
+        "--step-months",
+        type=int,
+        default=1,
+        help="For backfill mode: Step size in months for rolling window"
+    )
+
     args = parser.parse_args()
 
-    train_and_write_all_flow_models(
+    run_flow_ml_pipeline(
         targets_ini=args.targets_ini,
         lookback_days=args.lookback_days,
         only_target=args.only_target,
+        mode=args.mode,
+        step_months=args.step_months,
     )
 
 
