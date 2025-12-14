@@ -135,6 +135,17 @@ class TrendFeatureEngine:
         df["rsi_prev_n"] = df["rsi_now"].shift(p_div_n)
         df["close_prev_n"] = c.shift(p_div_n)
 
+        # Slopes (Normalized: % change over 5 bars)
+        # V2 logic: (s - s.shift(5)) / s * 100 (approx)
+        # Actually V2 used: (s.iloc[-1] - s.iloc[-5]) / s.iloc[-1] * 100
+        # For vectorization: (s - s.shift(5)) / s * 100
+        def _calc_slope(s):
+            return (s - s.shift(5)) / s.replace(0, np.nan) * 100.0
+
+        df["slope_short"] = _calc_slope(df["ema10"])
+        df["slope_mid"] = _calc_slope(df["ema20"])
+        df["slope_long"] = _calc_slope(df["ema50"])
+
         # ---------------------------------------------------------
         # 4. Booleans / Logical Flags (for easier Rules)
         # ---------------------------------------------------------
