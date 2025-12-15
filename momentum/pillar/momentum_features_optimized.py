@@ -91,10 +91,177 @@ class MomentumFeatureEngine:
             "scenarios": scenarios,
         }
 
-    def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_daily_context(self, df: pd.DataFrame, daily_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        """
+        Merge Daily Context (ATR, Prev Close, etc.) from external daily_df.
+        """
+        if df.empty:
+            return df
+
+        # Initialize defaults
+        df["dist_to_daily_open_atr"] = 0.0
+        df["gap_size_atr"] = 0.0
+        df["day_range_consumed"] = 0.0
+        # If no daily_df provided (or empty), fallback to 15m proxy for critical 'day_atr'
+        # so code doesn't crash later
+        df["day_atr"] = df["atr_val"] * 5.0 # Rough approximation
+
+        if daily_df is None or daily_df.empty:
+            return df
+
+        # Prepare Daily Data
+        # daily_df comes from raw_ingest.daily_futures
+        # Expected cols: trade_date, symbol, price (close), open_price, high_price, low_price
+
+        # 1. Calc Daily ATR(14) if not present
+        # We need to process daily_df by symbol
+        daily_processed = []
+        for sym, d_grp in daily_df.groupby("symbol"):
+            d_grp = d_grp.sort_values("trade_date").copy()
+
+            # Ensure floats
+            for c in ["high_price", "low_price", "price", "open_price"]:
+                if c in d_grp.columns:
+                    d_grp[c] = d_grp[c].astype(float)
+
+            # ATR
+            d_grp["_d_atr"] = _calc_atr(d_grp["high_price"], d_grp["low_price"], d_grp["price"], 14)
+
+            # We need stats for the *current* day based on *previous* data
+            # Prev Close
+            d_grp["_d_prev_close"] = d_grp["price"].shift(1)
+            # Prev Day ATR (defines today's regime)
+            d_grp["_d_prev_atr"] = d_grp["_d_atr"].shift(1)
+
+            daily_processed.append(d_grp)
+
+        if not daily_processed:
+            return df
+
+        daily_ready = pd.concat(daily_processed)
+
+        # 2. Prepare 15m DF for merge
+        # Map timestamp to Date (IST) to match trade_date
+        # Assuming trade_date is just date object.
+
+        df_in = df.copy()
+        if df_in["ts"].dt.tz is None:
+             # Assume UTC, convert to IST
+             pass
+
+        # Safe conversion to IST date
+        # If already tz-aware (UTC), convert to IST then date
+        # If naive, assume UTC?
+        try:
+            df_in["_merge_date"] = df_in["ts"].dt.tz_convert("Asia/Kolkata").dt.date
+        except TypeError:
+            # Maybe already naive? Assume it's UTC naive
+            df_in["_merge_date"] = df_in["ts"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.date
+
+        # 3. Merge
+        # Join on symbol + date
+        # daily_ready cols: symbol, trade_date, open_price, _d_prev_close, _d_prev_atr
+
+        daily_subset = daily_ready[["symbol", "trade_date", "open_price", "_d_prev_close", "_d_prev_atr"]].copy()
+        daily_subset["trade_date"] = pd.to_datetime(daily_subset["trade_date"]).dt.date
+
+        merged = df_in.merge(
+            daily_subset,
+            left_on=["symbol", "_merge_date"],
+            right_on=["symbol", "trade_date"],
+            how="left"
+        )
+
+        # 4. Compute Features
+
+        # Fill missing daily values
+        # If _d_prev_atr is nan (first 14 days), fallback to something?
+        # Or let it be NaN (will result in NaN features, row dropped later)
+        # We'll forward fill within symbol? No, merge is precise.
+        # Fallback to intraday approximation if missing?
+
+        # Fill day_atr with proxy if missing
+        merged["day_atr"] = merged["_d_prev_atr"].fillna(merged["atr_val"] * 5.0)
+
+        # dist_to_daily_open: (Close - Daily_Open) / Daily_ATR
+        # Use daily_df['open_price'] which is the official open
+        # Fallback to intraday open if missing?
+        # Intraday open for the day is hard to get efficiently without groupby
+
+        # We assume daily data is good.
+        merged["dist_to_daily_open_atr"] = (merged["close"] - merged["open_price"]) / merged["day_atr"]
+
+        # gap_size_atr: (Daily_Open - Prev_Close) / Daily_ATR
+        merged["gap_size_atr"] = (merged["open_price"] - merged["_d_prev_close"]) / merged["day_atr"]
+
+        # day_range_consumed: (High_So_Far - Low_So_Far) / Daily_ATR
+        # We still need High_So_Far from intraday data
+        # because "Daily High" in daily_df is the FINAL high. We are at time T.
+        # So we must use intraday cummax/cummin logic.
+
+        merged["_day_high_sofar"] = merged.groupby(["symbol", "_merge_date"])["high"].cummax()
+        merged["_day_low_sofar"] = merged.groupby(["symbol", "_merge_date"])["low"].cummin()
+
+        merged["day_range_consumed"] = (merged["_day_high_sofar"] - merged["_day_low_sofar"]) / merged["day_atr"]
+
+        # Fill NaNs in features with 0.0 to avoid dropping rows?
+        # Better to have 0.0 than NaN for ML
+        # But 'day_range_consumed' is valid.
+
+        # Update original DF
+        cols = ["day_atr", "dist_to_daily_open_atr", "gap_size_atr", "day_range_consumed"]
+        for c in cols:
+            df[c] = merged[c].values
+
+        return df
+
+    def _compute_oi_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute OI-based features: OI % Chg, OI Z-Score, VOI.
+        """
+        if "oi" not in df.columns:
+            df["oi_pct_change"] = 0.0
+            df["oi_zscore"] = 0.0
+            df["voi_norm"] = 0.0
+            return df
+
+        # OI % Change
+        # Replace 0 OI to avoid inf
+        oi_safe = df["oi"].replace(0, np.nan)
+        df["oi_pct_change"] = df["oi"].pct_change() * 100.0
+        df["oi_pct_change"] = df["oi_pct_change"].fillna(0.0)
+
+        # OI Trend Score: Z-Score(OI) over last 5 days
+        # 5 days * 25 bars/day = 125 bars.
+        win_oi = 125
+        oi_mu = df["oi"].rolling(win_oi).mean()
+        oi_std = df["oi"].rolling(win_oi).std().replace(0, np.nan)
+        df["oi_zscore"] = (df["oi"] - oi_mu) / oi_std
+        df["oi_zscore"] = df["oi_zscore"].fillna(0.0)
+
+        # VOI (Volume Weighted OI) - Normalized
+        # Formula: Sign(dPrice) * dOI * (Vol / AvgVol)
+
+        d_price = df["close"].diff()
+        d_oi = df["oi"].diff()
+
+        vol_avg = df["volume"].rolling(20).mean().replace(0, np.nan)
+        vol_ratio = df["volume"] / vol_avg
+        vol_ratio = vol_ratio.fillna(0.0) # If avg is nan/0
+
+        df["voi_norm"] = np.sign(d_price) * d_oi * vol_ratio
+        df["voi_norm"] = df["voi_norm"].fillna(0.0)
+
+        return df
+
+    def compute_features(self, df: pd.DataFrame, daily_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
         Compute all technical indicators required for Momentum scenarios.
         Returns a DataFrame with all feature columns added.
+
+        Args:
+            df: 15m candles (must include 'oi' if available)
+            daily_df: Optional Daily candles from raw_ingest.daily_futures for context.
         """
         if df.empty:
             return df
@@ -103,7 +270,7 @@ class MomentumFeatureEngine:
         df = df.copy()
 
         # Ensure numeric
-        for c in ["open", "high", "low", "close", "volume"]:
+        for c in ["open", "high", "low", "close", "volume", "oi"]:
             if c in df.columns:
                 df[c] = df[c].astype(float).fillna(0.0)
 
@@ -128,9 +295,6 @@ class MomentumFeatureEngine:
         # Prevent div/0
         c_safe = close.replace(0, np.nan)
         df["atr_pct"] = (atr_s / c_safe) * 100.0
-
-        # Day ATR: Map to current timeframe ATR as fallback
-        df["day_atr"] = df["atr_val"]
 
         # MACD
         # Standard 12, 26, 9
@@ -254,6 +418,12 @@ class MomentumFeatureEngine:
         df["low_prev_n"] = low.shift(n_look)
 
         # ---------------------------------------------------------
+        # NEW: Daily Context & OI Features
+        # ---------------------------------------------------------
+        df = self._compute_daily_context(df, daily_df)
+        df = self._compute_oi_features(df)
+
+        # ---------------------------------------------------------
         # 2. Evaluate Scenarios (Vectorized)
         # ---------------------------------------------------------
 
@@ -324,5 +494,8 @@ class MomentumFeatureEngine:
             "rsi_std", "rsi5", "atr_pct", "macd_line", "macd_sig", "hist",
             "adx14", "di_plus", "di_minus", "bb_width_pct", "bb_width_pct_rank",
             "rmi", "z_obv", "rvol_now", "mfi", "whipsaw_flips", "squeeze_flag",
-            "roc21", "roc_atr_ratio", "MOM.score", "MOM.veto_flag"
+            "roc21", "roc_atr_ratio", "MOM.score", "MOM.veto_flag",
+            # New columns
+            "dist_to_daily_open_atr", "gap_size_atr", "day_range_consumed",
+            "oi_pct_change", "oi_zscore", "voi_norm"
         ]
