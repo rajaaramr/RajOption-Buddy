@@ -8,7 +8,7 @@ import os
 import sys
 import traceback
 from typing import Any, Optional, Iterable, List, Tuple, Dict, TypedDict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 import json, re
 
 import numpy as np
@@ -913,60 +913,96 @@ def write_futures_vwap_session(
 
     # Optimization: Calculate on full history for correctness, but only write recent data
     # to avoid massive DB I/O on every run.
-    if start_dt:
-        last_ts = start_dt
-    else:
-        last_ts = _get_last_vwap_ts(symbol, "futures")
 
-    if last_ts:
-        # Overlap by ~4 hours to ensure continuity and catch late updates/re-calcs
-        # Ensure last_ts is offset-aware (it should be from universe fetch)
+    # Check internal DB state for VWAP specifically, to detect if we need a full backfill
+    # even if the global 'start_dt' says we are up to date.
+    last_internal_ts = _get_last_vwap_ts(symbol, "futures")
+
+    if last_internal_ts is None:
+        # Never wrote VWAP session? Force full backfill.
+        vwap_series_write = vwap_series
+        # Set write_cutoff to the beginning of time or the first timestamp to avoid UnboundLocalError below
+        # used for base_series_write
+        if not vwap_series.empty:
+            write_cutoff = vwap_series.index[0]
+        else:
+            write_cutoff = datetime.now(TZ) - timedelta(days=3650)
+    elif start_dt:
+        # We have history, so respect the incremental start_dt (global gate)
+        last_ts = start_dt
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
+        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
     else:
-        # No history? Write last 2 days as a safe default for "live" backfill
-        write_cutoff = datetime.now(TZ) - timedelta(days=2)
+        # Fallback to internal TS if no start_dt provided
+        last_ts = last_internal_ts
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=TZ)
+        write_cutoff = last_ts - timedelta(hours=4)
+    # We must write this series for ALL tracked timeframes (resampled).
+    # If we only write to 15m, the other TFs will have NULL vwap_session.
 
-    vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+    # The 'vwap_series' is on 15m base. We filter it for writing.
+    base_series_write = vwap_series[vwap_series.index >= write_cutoff]
 
-    # Build bulk rows for UPSERT
-    payload = []
-    for ts, val in vwap_series_write.items():
-        if pd.isna(val):
+    total_written = 0
+
+    for tf in PIVOT_TFS:  # ["15m", "30m", "60m", ...]
+        if tf == "15m":
+            target_series = base_series_write
+        else:
+            # Resample the 15m VWAP to target TF (taking last value in bin)
+            rule = _PIVOT_TF_TO_OFFSET.get(tf)
+            if not rule: continue
+            # We resample the *original* filtered slice or the full slice?
+            # Better to resample the full 'vwap_series' then slice by write_cutoff
+            # to ensure the first bar in the window is correct (resampling edge effects).
+            resampled = vwap_series.resample(rule, label='right', closed='right').last().dropna()
+            target_series = resampled[resampled.index >= write_cutoff]
+
+        if target_series.empty:
             continue
-        payload.append(
-            (
-                symbol,
-                BASE_INTERVAL,
-                ts.to_pydatetime(),
-                float(val),
-                run_id,
-                source,
-            )
-        )
-    if not payload:
-        return 0
 
-    # Upsert on (symbol, interval, ts): set vwap_session, run_id, source, updated_at
-    with get_db_connection() as conn, conn.cursor() as cur:
-        pgx.execute_values(
-            cur,
-            f"""
-            INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
-            VALUES %s
-            ON CONFLICT (symbol, interval, ts)
-            DO UPDATE SET
-              vwap_session = EXCLUDED.vwap_session,
-              run_id       = EXCLUDED.run_id,
-              source       = EXCLUDED.source,
-              updated_at   = NOW()
-            """,
-            payload,
-            page_size=1000,
-        )
-        conn.commit()
-    return len(payload)
+        payload = []
+        for ts, val in target_series.items():
+            if pd.isna(val):
+                continue
+            payload.append(
+                (
+                    symbol,
+                    tf,
+                    ts.to_pydatetime(),
+                    float(val),
+                    run_id,
+                    source,
+                )
+            )
+
+        if not payload:
+            continue
+
+        # Upsert on (symbol, interval, ts)
+        with get_db_connection() as conn, conn.cursor() as cur:
+            pgx.execute_values(
+                cur,
+                f"""
+                INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
+                VALUES %s
+                ON CONFLICT (symbol, interval, ts)
+                DO UPDATE SET
+                  vwap_session = EXCLUDED.vwap_session,
+                  run_id       = EXCLUDED.run_id,
+                  source       = EXCLUDED.source,
+                  updated_at   = NOW()
+                """,
+                payload,
+                page_size=1000,
+            )
+            conn.commit()
+        total_written += len(payload)
+
+    return total_written
 
 
 def write_spot_vwap_session(
@@ -997,55 +1033,83 @@ def write_spot_vwap_session(
     table = "indicators.spot_frames"
 
     # Optimization: Calculate on full history for correctness, but only write recent data
-    if start_dt:
-        last_ts = start_dt
-    else:
-        last_ts = _get_last_vwap_ts(symbol, "spot")
 
-    if last_ts:
+    # Check internal DB state for VWAP specifically
+    last_internal_ts = _get_last_vwap_ts(symbol, "spot")
+
+    if last_internal_ts is None:
+        # Never wrote VWAP session? Force full backfill.
+        vwap_series_write = vwap_series
+        if not vwap_series.empty:
+            write_cutoff = vwap_series.index[0]
+        else:
+            write_cutoff = datetime.now(TZ) - timedelta(days=3650)
+    elif start_dt:
+        last_ts = start_dt
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=TZ)
         write_cutoff = last_ts - timedelta(hours=4)
+        vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
     else:
-        write_cutoff = datetime.now(TZ) - timedelta(days=2)
+        last_ts = last_internal_ts
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=TZ)
+        write_cutoff = last_ts - timedelta(hours=4)
+    # We must write this series for ALL tracked timeframes (resampled).
 
-    vwap_series_write = vwap_series[vwap_series.index >= write_cutoff]
+    total_written = 0
 
-    payload = []
-    for ts, val in vwap_series_write.items():
-        if pd.isna(val):
+    for tf in PIVOT_TFS:  # ["15m", "30m", "60m", ...]
+        if tf == "15m":
+            # 15m is base
+            target_series = vwap_series[vwap_series.index >= write_cutoff]
+        else:
+            # Resample the full 15m VWAP to target TF then slice
+            rule = _PIVOT_TF_TO_OFFSET.get(tf)
+            if not rule: continue
+            resampled = vwap_series.resample(rule, label='right', closed='right').last().dropna()
+            target_series = resampled[resampled.index >= write_cutoff]
+
+        if target_series.empty:
             continue
-        payload.append(
-            (
-                symbol,
-                BASE_INTERVAL,
-                ts.to_pydatetime(),
-                float(val),
-                run_id,
-                source,
-            )
-        )
-    if not payload:
-        return 0
 
-    with get_db_connection() as conn, conn.cursor() as cur:
-        pgx.execute_values(
-            cur,
-            f"""
-            INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
-            VALUES %s
-            ON CONFLICT (symbol, interval, ts)
-            DO UPDATE SET
-              vwap_session = EXCLUDED.vwap_session,
-              run_id       = EXCLUDED.run_id,
-              source       = EXCLUDED.source,
-              updated_at   = NOW()
-            """,
-            payload,
-            page_size=1000,
-        )
-        conn.commit()
-    return len(payload)
+        payload = []
+        for ts, val in target_series.items():
+            if pd.isna(val):
+                continue
+            payload.append(
+                (
+                    symbol,
+                    tf,
+                    ts.to_pydatetime(),
+                    float(val),
+                    run_id,
+                    source,
+                )
+            )
+        if not payload:
+            continue
+
+        with get_db_connection() as conn, conn.cursor() as cur:
+            pgx.execute_values(
+                cur,
+                f"""
+                INSERT INTO {table} (symbol, interval, ts, vwap_session, run_id, source)
+                VALUES %s
+                ON CONFLICT (symbol, interval, ts)
+                DO UPDATE SET
+                  vwap_session = EXCLUDED.vwap_session,
+                  run_id       = EXCLUDED.run_id,
+                  source       = EXCLUDED.source,
+                  updated_at   = NOW()
+                """,
+                payload,
+                page_size=1000,
+            )
+            conn.commit()
+        total_written += len(payload)
+
+    return total_written
 
 
 def _load_recent_15m(
@@ -1131,14 +1195,15 @@ def write_vwap_extensions(
     pv = tp * df["volume"]
 
     # rolling 20 over the last 20 bars
-    roll_v = df["volume"].rolling(20, min_periods=1).sum().replace(0, pd.NA)
+    roll_v = df["volume"].rolling(20, min_periods=1).sum()
     roll_pv = pv.rolling(20, min_periods=1).sum()
-    vwap_roll_20 = (roll_pv / roll_v).replace({pd.NA: np.nan}).astype("float64")
+    # Avoid div/0 by replacing 0 with NaN before division
+    vwap_roll_20 = (roll_pv / roll_v.replace(0, np.nan)).astype("float64")
 
     # cumulative since earliest loaded bar (stable across the window)
-    cum_v = df["volume"].cumsum().replace(0, pd.NA)
+    cum_v = df["volume"].cumsum()
     cum_pv = pv.cumsum()
-    vwap_cum = (cum_pv / cum_v).replace({pd.NA: np.nan}).astype("float64")
+    vwap_cum = (cum_pv / cum_v.replace(0, np.nan)).astype("float64")
 
     table = _frames_table(kind)
     run_id = run_id or datetime.now(TZ).strftime("ind_%Y%m%d")
@@ -1206,42 +1271,6 @@ def write_pivots_all_tfs(
     if df15 is None or df15.empty:
         return 0
 
-    # --- Daily pivots from previous day's OHLC (IST) ---
-    df_ist = df15.copy()
-    df_ist.index = df_ist.index.tz_convert("Asia/Kolkata")
-    df_ist["date"] = df_ist.index.date
-
-    daily = df_ist.groupby("date").agg(
-        {"high": "max", "low": "min", "close": "last"}
-    ).dropna(subset=["high", "low", "close"])
-
-    if len(daily) < 2:
-        return 0
-
-    prev = daily.shift(1).dropna()  # pivots for D from OHLC of D-1
-
-    pp = (prev["high"] + prev["low"] + prev["close"]) / 3.0
-    r1 = 2 * pp - prev["low"]
-    s1 = 2 * pp - prev["high"]
-    r2 = pp + (prev["high"] - prev["low"])
-    s2 = pp - (prev["high"] - prev["low"])
-    r3 = prev["high"] + 2 * (pp - prev["low"])
-    s3 = prev["low"] - 2 * (prev["high"] - pp)
-
-    piv = pd.DataFrame(
-        {
-            "P": pp,
-            "R1": r1,
-            "S1": s1,
-            "R2": r2,
-            "S2": s2,
-            "R3": r3,
-            "S3": s3,
-        }
-    )
-    piv.index.name = "date"
-    piv_reset = piv.reset_index()  # date | P R1 S1 R2 S2 R3 S3
-
     table = _frames_table(kind)
     run_id = run_id or datetime.now(TZ).strftime("ind_%Y%m%d")
 
@@ -1253,27 +1282,43 @@ def write_pivots_all_tfs(
         if dftf is None or dftf.empty:
             continue
 
-        dftf_ist = dftf.copy()
-        dftf_ist.index = dftf_ist.index.tz_convert("Asia/Kolkata")
-        dftf_ist["date"] = dftf_ist.index.date
-        dftf_ist = dftf_ist.rename_axis("ts").reset_index()
+        # Calculate Timeframe-based Pivots (Previous Bar Logic)
+        # Shift HLC by 1 to get "Previous Bar" values
+        prev = dftf.shift(1)
 
-        merged = dftf_ist.merge(piv_reset, on="date", how="left")
-        merged = merged.dropna(subset=["P"])
-        if merged.empty:
+        # Standard Floor Pivot Formulas
+        pp = (prev["high"] + prev["low"] + prev["close"]) / 3.0
+        r1 = 2 * pp - prev["low"]
+        s1 = 2 * pp - prev["high"]
+        r2 = pp + (prev["high"] - prev["low"])
+        s2 = pp - (prev["high"] - prev["low"])
+        r3 = prev["high"] + 2 * (pp - prev["low"])
+        s3 = prev["low"] - 2 * (prev["high"] - pp)
+
+        # Combine into a DataFrame for easy iteration
+        # We use the index (ts) of the *current* bar, but values derived from *previous* bar
+        pivs = pd.DataFrame({
+            "P": pp, "R1": r1, "S1": s1,
+            "R2": r2, "S2": s2, "R3": r3, "S3": s3,
+            "close": dftf["close"]
+        }).dropna()
+
+        if pivs.empty:
             continue
 
-        r1_dist = ((merged["close"] - merged["R1"]) / merged["R1"]) * 100.0
-        s1_dist = ((merged["close"] - merged["S1"]) / merged["S1"]) * 100.0
+        # Calculate distances
+        # Distance % = (Close - Level) / Level * 100
+        r1_dist = ((pivs["close"] - pivs["R1"]) / pivs["R1"]) * 100.0
+        s1_dist = ((pivs["close"] - pivs["S1"]) / pivs["S1"]) * 100.0
 
-        for i, row in merged.iterrows():
-            ts = pd.to_datetime(row["ts"], utc=True).to_pydatetime()
+        for ts, row in pivs.iterrows():
+            ts_dt = pd.to_datetime(ts, utc=True).to_pydatetime()
             try:
                 all_rows.append(
                     (
                         symbol,
                         tf,
-                        ts,
+                        ts_dt,
                         float(row["P"]),
                         float(row["R1"]),
                         float(row["S1"]),
@@ -1281,8 +1326,8 @@ def write_pivots_all_tfs(
                         float(row["S2"]),
                         float(row["R3"]),
                         float(row["S3"]),
-                        float(r1_dist.iloc[i]),
-                        float(s1_dist.iloc[i]),
+                        float(r1_dist.loc[ts]),
+                        float(s1_dist.loc[ts]),
                         run_id,
                         source,
                     )
@@ -1360,14 +1405,14 @@ def _compute_tf_vwap_from_15m(
     tf["r20_tpvol"] = tf["tpvol"].rolling(20, min_periods=1).sum()
     tf["r20_vol"] = tf["vol"].rolling(20, min_periods=1).sum()
     tf["vwap_rolling_20_calc"] = (
-        tf["r20_tpvol"] / tf["r20_vol"].replace(0, pd.NA)
-    ).replace({pd.NA: np.nan}).astype("float64")
+        tf["r20_tpvol"] / tf["r20_vol"].replace(0, np.nan)
+    ).astype("float64")
 
     tf["cum_tpvol"] = tf["tpvol"].cumsum()
     tf["cum_vol"] = tf["vol"].cumsum()
     tf["vwap_cumulative_calc"] = (
-        tf["cum_tpvol"] / tf["cum_vol"].replace(0, pd.NA)
-    ).replace({pd.NA: np.nan}).astype("float64")
+        tf["cum_tpvol"] / tf["cum_vol"].replace(0, np.nan)
+    ).astype("float64")
 
     return tf[
         ["ts", "vwap_rolling_20_calc", "vwap_cumulative_calc"]
@@ -1552,7 +1597,7 @@ NL_ENABLE = (
 
 
 # --- replace the old function with this ---
-def _call_nonlinear(symbol: str, kind: str) -> None:
+def _call_nonlinear(symbol: str, kind: str, start_dt: Optional[datetime] = None) -> None:
     """
     Optional nonlinear features. No webhook status, no return value required.
     Safe to no-op if module shape differs.
@@ -1563,15 +1608,21 @@ def _call_nonlinear(symbol: str, kind: str) -> None:
     try:
         # prefer the explicit API if present
         if hasattr(nlf, "process_symbol"):
-            nlf.process_symbol(symbol, kind=kind)  # type: ignore
+            try:
+                nlf.process_symbol(symbol, kind=kind, start_dt=start_dt)
+            except TypeError:
+                nlf.process_symbol(symbol, kind=kind)
             return
         # fall back to a more generic entry point
         if hasattr(nlf, "run"):
             # support either signature
             try:
-                nlf.run(symbol=symbol, kind=kind)  # type: ignore
+                nlf.run(symbol=symbol, kind=kind, start_dt=start_dt)  # type: ignore
             except TypeError:
-                nlf.run([symbol], kind=kind)  # type: ignore
+                try:
+                    nlf.run(symbol=symbol, kind=kind)
+                except TypeError:
+                    nlf.run([symbol], kind=kind)  # type: ignore
             return
         # nothing to do if the module has no entry point
         print(
@@ -1799,7 +1850,7 @@ def run_once(limit: int = 50, kinds: Iterable[str] = ("spot", "futures")):
                     f"[VPBB ERROR] {sym} [{kind}] → {e}\n{traceback.format_exc()}"
                 )
             try:
-                _call_nonlinear(sym, kind=kind)
+                _call_nonlinear(sym, kind=kind, start_dt=last_run_at)
             except Exception as e:
                 print(
                     f"[Non_Linear ERROR] {sym} [{kind}] → {e}\n{traceback.format_exc()}"
